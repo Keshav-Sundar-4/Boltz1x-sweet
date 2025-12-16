@@ -54,6 +54,9 @@ class BoltzTokenizer(Tokenizer):
         if struct.glycosylation_sites is not None and struct.glycosylation_sites.size > 0:
             # Use np.atleast_1d to handle the case of a single site loaded as a 0-d array
             for site in np.atleast_1d(struct.glycosylation_sites):
+                # FIX: Handle case where serialization loaded a None scalar into the array
+                if site is None:
+                    continue
                 glycosylated_residues.add((site["protein_chain_id"], site["protein_res_id"]))
 
         # Create token data
