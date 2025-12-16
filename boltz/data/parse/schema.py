@@ -701,375 +701,517 @@ def parse_polymer(
         cyclic_period=cyclic_period,
     )
 
-
-def parse_boltz_schema(  # noqa: C901, PLR915, PLR912
+def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     name: str,
     schema: dict,
     ccd: Mapping[str, Mol],
 ) -> Target:
+    """Parse a Boltz input yaml / json.
+
+    Integrates:
+    1. Protein/DNA/RNA parsing.
+    2. Ligand parsing (CCD and SMILES).
+    3. Glycan parsing (IUPAC with Anomeric/Stoichiometry logic).
+    4. Constraints (Bonds, Pockets, Glycosylation).
     """
-    (Corrected Version) Parses a Boltz input yaml / json.
-    This version is modified to correctly handle glycosylated standard amino acids
-    by pre-parsing glycosylation sites and passing this information to the
-    polymer parser, ensuring correct bond generation. It also correctly separates
-    inter-chain bonds (like glycosylation sites) into the 'connections' array.
-    """
+    # Assert version 1
     version = schema.get("version", 1)
     if version != 1:
         msg = f"Invalid version {version} in input!"
         raise ValueError(msg)
 
-    blocker = rdBase.BlockLogs()
+    # Disable rdkit warnings
+    blocker = rdBase.BlockLogs()  # noqa: F841
 
-    # --- FIX: Step 1 - Pre-parse glycosylation sites for easy lookup ---
-    glycosylation_sites_lookup = set()
-    if "glycosylation" in schema:
-        for site in schema.get("glycosylation", []):
-            try:
-                prot_spec = site["site"]["protein"]
-                p_chain, p_res_1based = prot_spec[0], prot_spec[1]
-                glycosylation_sites_lookup.add((p_chain, p_res_1based - 1))  # Store as 0-based index
-            except (IndexError, KeyError) as e:
-                raise ValueError(f"Malformed protein site in glycosylation block: {site}. Details: {e}") from e
-
-    # --- GLYCAN-SPECIFIC DATA STRUCTURES (Unchanged) ---
-    local_glycan_feature_map: MonosaccharideFeatureMapType = {}
-    local_atom_to_mono_idx_maps: Dict[int, np.ndarray] = {}
-    all_glycan_prelim_features: Dict[str, dict] = {}
-    all_glycan_atom_maps: Dict[str, np.ndarray] = {}
-    glycan_source_indices: Dict[str, int] = {}
-
-    # --- Grouping and initial setup (Unchanged) ---
-    items_to_group: Dict[Tuple[str, str], List[Tuple[int, dict]]] = {}
-    for item_idx, item in enumerate(schema["sequences"]):
+    # --- 1. Group items by entity type and sequence ---
+    items_to_group = {}
+    for item in schema["sequences"]:
+        # Get entity type
         entity_type = next(iter(item.keys())).lower()
         if entity_type not in {"protein", "dna", "rna", "ligand", "glycan"}:
-            msg = f"Invalid entity type: {entity_type} in item {item_idx}"
+            msg = f"Invalid entity type: {entity_type}"
             raise ValueError(msg)
-        data = item[entity_type]
-        definition = ""
-        if entity_type in {"protein", "dna", "rna"}:
-            definition = str(data["sequence"])
-        elif entity_type == "ligand":
-            definition = f"smiles:{data['smiles']}" if "smiles" in data else f"ccd:{data['ccd']}"
-        elif entity_type == "glycan":
-            definition = f"iupac:{data['iupac']}:idx:{item_idx}"
-        items_to_group.setdefault((entity_type, definition), []).append((item_idx, item))
 
-    # --- Main Parsing Loop ---
+        # Get sequence definition for grouping
+        if entity_type in {"protein", "dna", "rna"}:
+            seq = str(item[entity_type]["sequence"])
+        elif entity_type == "ligand":
+            assert "smiles" in item[entity_type] or "ccd" in item[entity_type]
+            assert "smiles" not in item[entity_type] or "ccd" not in item[entity_type]
+            if "smiles" in item[entity_type]:
+                seq = f"smiles:{item[entity_type]['smiles']}"
+            else:
+                seq = f"ccd:{item[entity_type]['ccd']}"
+        elif entity_type == "glycan":
+            # Group glycans by their IUPAC string
+            seq = f"iupac:{item[entity_type]['iupac']}"
+            
+        items_to_group.setdefault((entity_type, seq), []).append(item)
+
+    # --- 2. Parse Entities into Chains ---
     chains: dict[str, ParsedChain] = {}
     chain_to_msa: dict[str, str] = {}
     entity_to_seq: dict[str, str] = {}
-    definition_to_entity_id: Dict[str, int] = {}
-    entity_counter = 0
+    
+    # Storage for extra glycan data that doesn't fit into standard ParsedChain
+    # Map: entity_id -> { 'internal_connections': ..., 'feature_map': ..., 'atom_map': ... }
+    glycan_extra_data = {} 
+
     is_msa_custom = False
     is_msa_auto = False
 
-    for (entity_type, definition), item_tuples in items_to_group.items():
-        items = [item_dict for _, item_dict in item_tuples]
-        chem_definition = definition
-        if entity_type == 'glycan':
-            chem_definition = definition.split(':idx:')[0]
-        elif entity_type == 'ligand' and chem_definition.startswith('ccd:'):
-            chem_definition = f"ccd:{str(items[0][entity_type]['ccd'])}"
+    for entity_id, items in enumerate(items_to_group.values()):
+        # Get entity type
+        entity_type = next(iter(items[0].keys())).lower()
 
-        current_entity_id = definition_to_entity_id.setdefault(chem_definition, entity_counter)
-        if current_entity_id == entity_counter:
-            entity_to_seq[str(entity_counter)] = chem_definition
-            entity_counter += 1
-
-        # --- FIX: Modified Protein Parsing Logic ---
+        # MSA Handling (Proteins)
+        msa = -1
         if entity_type == "protein":
-            seq = items[0][entity_type]["sequence"]
-            msa_str = items[0][entity_type].get("msa", 0)
-            msa_value = -1 if msa_str == "empty" else (msa_str if msa_str not in (0, None, "") else 0)
-            if msa_value != 0 and msa_value != -1: is_msa_custom = True
-            elif msa_value == 0: is_msa_auto = True
+            msa = items[0][entity_type].get("msa", 0)
+            if (msa is None) or (msa == ""):
+                msa = 0
 
-            token_map = const.prot_letter_to_token
-            unk_token = const.unk_token["PROTEIN"]
-            seq_tokens = [token_map.get(c, unk_token) for c in list(seq)]
-            for mod in items[0][entity_type].get("modifications", []):
-                idx = mod["position"] - 1
-                if 0 <= idx < len(seq_tokens): seq_tokens[idx] = mod["ccd"]
-                else: raise ValueError(f"Modification position {mod['position']} out of bounds.")
+            # Check consistency
+            for item in items:
+                item_msa = item[entity_type].get("msa", 0)
+                if (item_msa is None) or (item_msa == ""):
+                    item_msa = 0
+                if item_msa != msa:
+                    raise ValueError("All proteins with the same sequence must share the same MSA!")
 
-            chain_type_id = const.chain_type_ids["PROTEIN"]
-            cyclic = items[0][entity_type].get("cyclic", False)
+            if msa == "empty":
+                msa = -1
+                click.echo("Found explicit empty MSA, running in single sequence mode.")
 
-            # Loop through each instance (chain) of this protein entity
-            for _, item in item_tuples:
-                chain_ids = item[entity_type]["id"]
-                if isinstance(chain_ids, str): chain_ids = [chain_ids]
-                for chain_name in chain_ids:
-                    if chain_name in chains:
-                        raise ValueError(f"Duplicate chain name '{chain_name}' in input.")
+            if msa not in (0, -1):
+                is_msa_custom = True
+            elif msa == 0:
+                is_msa_auto = True
 
-                    # For THIS specific chain, find which of its residues are glycosylated
-                    glycosylated_indices_for_this_chain = {
-                        res_idx for c_name, res_idx in glycosylation_sites_lookup if c_name == chain_name
-                    }
+        # --- A. Parse Polymer (Protein, DNA, RNA) ---
+        if entity_type in {"protein", "dna", "rna"}:
+            if entity_type == "rna":
+                token_map = const.rna_letter_to_token
+            elif entity_type == "dna":
+                token_map = const.dna_letter_to_token
+            elif entity_type == "protein":
+                token_map = const.prot_letter_to_token
 
-                    # Parse the chain with its specific glycosylation info
-                    parsed_chain = parse_polymer(
-                        sequence=seq_tokens,
-                        entity=str(current_entity_id),
-                        chain_type=chain_type_id,
-                        components=ccd,
-                        cyclic=cyclic,
-                        glycosylated_residue_indices=glycosylated_indices_for_this_chain
-                    )
-                    if parsed_chain is None:
-                        raise ValueError(f"Failed to parse polymer for chain '{chain_name}'")
-
-                    chains[chain_name] = parsed_chain
-                    chain_to_msa[chain_name] = msa_value
-            continue # Skip to the next entity group
-
-        # --- Unchanged logic for other entity types ---
-        parsed_chain_template: Optional[ParsedChain] = None
-        if entity_type in {"dna", "rna"}:
-            seq = items[0][entity_type]["sequence"]
-            token_map = const.rna_letter_to_token if entity_type == "rna" else const.dna_letter_to_token
+            chain_type = const.chain_type_ids[entity_type.upper()]
             unk_token = const.unk_token[entity_type.upper()]
-            seq_tokens = [token_map.get(c, unk_token) for c in list(seq)]
-            chain_type_id = const.chain_type_ids[entity_type.upper()]
+
+            seq_str = items[0][entity_type]["sequence"]
+            entity_to_seq[entity_id] = seq_str
+            seq_tokens = [token_map.get(c, unk_token) for c in list(seq_str)]
+
+            # Apply modifications
+            for mod in items[0][entity_type].get("modifications", []):
+                code = mod["ccd"]
+                idx = mod["position"] - 1
+                seq_tokens[idx] = code
+
             cyclic = items[0][entity_type].get("cyclic", False)
-            parsed_chain_template = parse_polymer(
-                sequence=seq_tokens, entity=str(current_entity_id),
-                chain_type=chain_type_id, components=ccd, cyclic=cyclic
+
+            # Pass glycosylation site indices to parser if protein (to avoid OXT addition)
+            # We need to scan ALL chains of this entity to find all potential sites
+            glyco_indices = set()
+            if entity_type == "protein" and "glycosylation" in schema:
+                potential_chain_ids = []
+                for item in items:
+                    ids = item[entity_type]["id"]
+                    if isinstance(ids, str): ids = [ids]
+                    potential_chain_ids.extend(ids)
+                
+                potential_chain_ids = set(potential_chain_ids)
+                
+                for site in schema.get("glycosylation", []):
+                    try:
+                        p_chain = site["site"]["protein"][0]
+                        p_res = site["site"]["protein"][1] - 1 # 0-based
+                        if p_chain in potential_chain_ids:
+                            glyco_indices.add(p_res)
+                    except:
+                        pass
+
+            parsed_chain = parse_polymer(
+                sequence=seq_tokens,
+                entity=entity_id,
+                chain_type=chain_type,
+                components=ccd,
+                cyclic=cyclic,
+                glycosylated_residue_indices=glyco_indices
             )
-        elif entity_type == "ligand":
-            ligand_residues = []
-            if chem_definition.startswith("ccd:"):
-                ccd_codes = items[0][entity_type]["ccd"]
-                if isinstance(ccd_codes, str): ccd_codes = [ccd_codes]
-                for res_idx, code in enumerate(ccd_codes):
-                    residue = parse_ccd_residue(name=code, ref_mol=ccd[code], res_idx=res_idx)
-                    ligand_residues.append(residue)
-            elif chem_definition.startswith("smiles:"):
-                smiles = chem_definition.split(":", 1)[1]
-                mol = AllChem.MolFromSmiles(smiles)
-                mol = AllChem.AddHs(mol)
-                canonical_order = list(AllChem.CanonicalRankAtoms(mol))
-                for atom, can_idx in zip(mol.GetAtoms(), canonical_order):
-                    atom.SetProp("name", atom.GetSymbol().upper() + str(can_idx + 1))
-                compute_3d_conformer(mol)
-                mol_no_h = AllChem.RemoveHs(mol, sanitize=False)
-                Chem.AssignStereochemistry(mol_no_h, cleanIt=True, force=True)
-                residue = parse_ccd_residue(name="LIG", ref_mol=mol_no_h, res_idx=0)
-                ligand_residues.append(residue)
-            parsed_chain_template = ParsedChain(entity=str(current_entity_id), residues=ligand_residues, type=const.chain_type_ids["NONPOLYMER"], cyclic_period=0)
+
+        # --- B. Parse Ligand (CCD) ---
+        elif (entity_type == "ligand") and "ccd" in (items[0][entity_type]):
+            seq = items[0][entity_type]["ccd"]
+            if isinstance(seq, str):
+                seq = [seq]
+
+            residues = []
+            for res_idx, code in enumerate(seq):
+                if code not in ccd:
+                    raise ValueError(f"CCD component {code} not found!")
+                residue = parse_ccd_residue(name=code, ref_mol=ccd[code], res_idx=res_idx)
+                residues.append(residue)
+
+            parsed_chain = ParsedChain(
+                entity=entity_id,
+                residues=residues,
+                type=const.chain_type_ids["NONPOLYMER"],
+                cyclic_period=0,
+            )
+            assert not items[0][entity_type].get("cyclic", False), "Cyclic flag not supported for ligands"
+
+        # --- C. Parse Ligand (SMILES) ---
+        elif (entity_type == "ligand") and ("smiles" in items[0][entity_type]):
+            seq = items[0][entity_type]["smiles"]
+            mol = AllChem.MolFromSmiles(seq)
+            if mol is None:
+                raise ValueError(f"Invalid SMILES string: {seq}")
+            mol = AllChem.AddHs(mol)
+
+            canonical_order = AllChem.CanonicalRankAtoms(mol)
+            for atom, can_idx in zip(mol.GetAtoms(), canonical_order):
+                atom_name = atom.GetSymbol().upper() + str(can_idx + 1)
+                if len(atom_name) > 4:
+                    raise ValueError(f"{seq} has atom name > 4 chars: {atom_name}")
+                atom.SetProp("name", atom_name)
+
+            success = compute_3d_conformer(mol)
+            if not success:
+                raise ValueError(f"Failed to compute 3D conformer for {seq}")
+
+            mol_no_h = AllChem.RemoveHs(mol)
+            Chem.AssignStereochemistry(mol_no_h, cleanIt=True, force=True)
+            residue = parse_ccd_residue(name="LIG", ref_mol=mol_no_h, res_idx=0)
+            
+            parsed_chain = ParsedChain(
+                entity=entity_id,
+                residues=[residue],
+                type=const.chain_type_ids["NONPOLYMER"],
+                cyclic_period=0,
+            )
+            assert not items[0][entity_type].get("cyclic", False), "Cyclic flag not supported for ligands"
+
+        # --- D. Parse Glycan (IUPAC) ---
         elif entity_type == "glycan":
-            source_glycan_idx, item = item_tuples[0]
-            glycan_data = item[entity_type]
-            iupac = glycan_data["iupac"]
-            chain_name = str(glycan_data.get("id", f"G{source_glycan_idx + 1}"))
-            if chain_name in chains: raise ValueError(f"Duplicate chain ID '{chain_name}'.")
-            parsed_residue, prelim_features, atom_map = parse_glycan(iupac, ccd)
-            if parsed_residue:
-                chains[chain_name] = ParsedChain(entity=str(current_entity_id), type=const.chain_type_ids["NONPOLYMER"], residues=[parsed_residue], cyclic_period=0)
-                chain_to_msa[chain_name] = 0
-                all_glycan_prelim_features[chain_name] = prelim_features
-                all_glycan_atom_maps[chain_name] = atom_map
-                glycan_source_indices[chain_name] = source_glycan_idx
-            continue
+            iupac_str = items[0][entity_type]["iupac"]
+            entity_to_seq[entity_id] = iupac_str
+            
+            # Use the new parse_glycan function
+            residues, internal_conns, feat_map, atom_map_arr = parse_glycan(iupac_str, ccd)
+            
+            parsed_chain = ParsedChain(
+                entity=entity_id,
+                residues=residues,
+                type=const.chain_type_ids["NONPOLYMER"],
+                cyclic_period=0
+            )
+            
+            # Store auxiliary data needed for flattening
+            glycan_extra_data[entity_id] = {
+                "internal_connections": internal_conns,
+                "feature_map": feat_map,
+                "atom_map": atom_map_arr
+            }
 
-        if parsed_chain_template is not None:
-            for _, item in item_tuples:
-                ids = item[entity_type]["id"]
-                if isinstance(ids, str): ids = [ids]
-                for chain_name in ids:
-                    if chain_name in chains: raise ValueError(f"Duplicate chain name '{chain_name}'.")
-                    chains[chain_name] = parsed_chain_template
-                    chain_to_msa[chain_name] = 0
+        else:
+            raise ValueError(f"Invalid entity type: {entity_type}")
+
+        # Add chains
+        for item in items:
+            ids = item[entity_type]["id"]
+            if isinstance(ids, str):
+                ids = [ids]
+            for chain_name in ids:
+                chains[chain_name] = parsed_chain
+                chain_to_msa[chain_name] = msa
+
+    if is_msa_custom and is_msa_auto:
+        raise ValueError("Cannot mix custom and auto-generated MSAs!")
+    if not chains:
+        raise ValueError("No chains parsed!")
+
+    # --- 3. Flatten Chains into Tables ---
+    atom_data, bond_data, res_data, chain_data = [], [], [], []
+    connections_list = []
     
-    # --- Step 3: Build final flat data arrays from ParsedChain objects ---
-    atom_data, res_data, chain_data, bond_data = [], [], [], []
-    rdkit_bounds_constraint_data, chiral_atom_constraint_data, stereo_bond_constraint_data = [], [], []
-    planar_bond_constraint_data, planar_ring_5_constraint_data, planar_ring_6_constraint_data = [], [], []
+    # RDKit Constraints
+    rdkit_bounds_constraint_data = []
+    chiral_atom_constraint_data = []
+    stereo_bond_constraint_data = []
+    planar_bond_constraint_data = []
+    planar_ring_5_constraint_data = []
+    planar_ring_6_constraint_data = []
+    
+    # Glycan specific global maps
+    global_glycan_feature_map = {}
+    global_atom_to_mono_idx_map = {}
 
-    atom_idx, res_idx = 0, 0
-    connections_list = [] # <<< FIX: INITIALIZE CONNECTIONS LIST
+    atom_idx = 0
+    res_idx = 0
+    asym_id = 0
     sym_count = {}
-    chain_to_idx: Dict[str, int] = {}
-    atom_idx_map: Dict[Tuple[str, int, str], int] = {}
-    res_map: Dict[Tuple[str, int], int] = {} # Map (chain_name, local_res_idx) -> global_res_idx
+    chain_to_idx = {}
+    atom_idx_map = {} # (chain_name, res_idx, atom_name) -> (asym_id, res_idx, atom_idx)
 
-    for asym_id, (chain_name, chain) in enumerate(sorted(chains.items())):
+    for asym_id, (chain_name, chain) in enumerate(chains.items()):
         res_num = len(chain.residues)
         atom_num = sum(len(res.atoms) for res in chain.residues)
         entity_id = int(chain.entity)
         sym_id = sym_count.get(entity_id, 0)
         
-        chain_data.append(
-            (chain_name, chain.type, entity_id, sym_id, asym_id, atom_idx,
-             atom_num, res_idx, res_num, chain.cyclic_period)
-        )
+        chain_data.append((
+            chain_name, chain.type, entity_id, sym_id, asym_id,
+            atom_idx, atom_num, res_idx, res_num, chain.cyclic_period
+        ))
+        
         chain_to_idx[chain_name] = asym_id
         sym_count[entity_id] = sym_id + 1
 
+        # GLYCAN HANDLING: If this entity has extra data, map it to global indices
+        if entity_id in glycan_extra_data:
+            g_data = glycan_extra_data[entity_id]
+            
+            # 1. Feature Map: (chain_idx, mono_idx) -> features
+            # 'feat_map' keys are just (mono_idx). We add the current asym_id.
+            for mono_i, feats in g_data["feature_map"].items():
+                # Re-wrap as MonosaccharideFeatures dataclass if not already
+                if isinstance(feats, dict):
+                    feat_obj = MonosaccharideFeatures(
+                        asym_id=asym_id,
+                        ccd_code=feats["ccd_code"],
+                        source_glycan_idx=0, # Placeholder
+                        anomeric_config=feats["anomeric_config"]
+                    )
+                else:
+                    feat_obj = feats
+                global_glycan_feature_map[(asym_id, mono_i)] = feat_obj
+            
+            # 2. Atom Map: chain_idx -> array
+            global_atom_to_mono_idx_map[asym_id] = g_data["atom_map"]
+            
+            # 3. Internal Connections
+            # stored as (parent_mono_idx, child_mono_idx, p_atom_local, c_atom_local)
+            # We need to calculate global atom indices.
+            
+            # First, map local mono indices to global atom start indices for this chain
+            # We do this by iterating the residues right here
+            current_chain_residue_atom_starts = []
+            temp_atom_counter = atom_idx
+            for res in chain.residues:
+                current_chain_residue_atom_starts.append(temp_atom_counter)
+                temp_atom_counter += len(res.atoms)
+
+            for p_mono, c_mono, p_atom_local, c_atom_local in g_data["internal_connections"]:
+                # Global Atom Idx = Start of Residue + Local Offset
+                p_atom_global = current_chain_residue_atom_starts[p_mono] + p_atom_local
+                c_atom_global = current_chain_residue_atom_starts[c_mono] + c_atom_local
+                
+                # We need the global residue indices for the connection struct
+                p_res_global = res_idx + p_mono
+                c_res_global = res_idx + c_mono
+                
+                connections_list.append((asym_id, asym_id, p_res_global, c_res_global, p_atom_global, c_atom_global))
+
+        # Flatten Residues
         for res in chain.residues:
             atom_center = atom_idx + res.atom_center
             atom_disto = atom_idx + res.atom_disto
-            res_data.append(
-                (res.name, res.type, res.idx, atom_idx, len(res.atoms),
-                 atom_center, atom_disto, res.is_standard, res.is_present)
-            )
-            res_map[(chain_name, res.idx)] = res_idx
+            res_data.append((
+                res.name, res.type, res.idx, atom_idx, len(res.atoms),
+                atom_center, atom_disto, res.is_standard, res.is_present
+            ))
 
-            if res.rdkit_bounds_constraints is not None:
+            # Constraints (Bounds, Chiral, Stereo, Planar) - Copy from old code
+            if res.rdkit_bounds_constraints:
                 for c in res.rdkit_bounds_constraints:
                     rdkit_bounds_constraint_data.append((tuple(a + atom_idx for a in c.atom_idxs), c.is_bond, c.is_angle, c.upper_bound, c.lower_bound))
-            if res.chiral_atom_constraints is not None:
+            if res.chiral_atom_constraints:
                 for c in res.chiral_atom_constraints:
                     chiral_atom_constraint_data.append((tuple(a + atom_idx for a in c.atom_idxs), c.is_reference, c.is_r))
-            if res.stereo_bond_constraints is not None:
+            if res.stereo_bond_constraints:
                 for c in res.stereo_bond_constraints:
                     stereo_bond_constraint_data.append((tuple(a + atom_idx for a in c.atom_idxs), c.is_check, c.is_e))
-            if res.planar_bond_constraints is not None:
+            if res.planar_bond_constraints:
                 for c in res.planar_bond_constraints:
                     planar_bond_constraint_data.append((tuple(a + atom_idx for a in c.atom_idxs),))
-            if res.planar_ring_5_constraints is not None:
+            if res.planar_ring_5_constraints:
                 for c in res.planar_ring_5_constraints:
                     planar_ring_5_constraint_data.append((tuple(a + atom_idx for a in c.atom_idxs),))
-            if res.planar_ring_6_constraints is not None:
+            if res.planar_ring_6_constraints:
                 for c in res.planar_ring_6_constraints:
                     planar_ring_6_constraint_data.append((tuple(a + atom_idx for a in c.atom_idxs),))
 
+            # Internal Bonds (e.g. within a ligand or residue)
             for bond in res.bonds:
                 bond_data.append((atom_idx + bond.atom_1, atom_idx + bond.atom_2, bond.type))
 
-            for local_atom_idx, atom in enumerate(res.atoms):
-                atom_idx_map[(chain_name, res.idx, atom.name)] = atom_idx
-                atom_data.append(
-                    (convert_atom_name(atom.name), atom.element, atom.charge,
-                     atom.coords, atom.conformer, atom.is_present, atom.chirality)
-                )
+            # Atoms
+            for atom in res.atoms:
+                atom_idx_map[(chain_name, res.idx, atom.name)] = (asym_id, res_idx, atom_idx)
+                atom_data.append((
+                    convert_atom_name(atom.name), atom.element, atom.charge,
+                    atom.coords, atom.conformer, atom.is_present, atom.chirality
+                ))
                 atom_idx += 1
             res_idx += 1
 
-    # --- Step 4: Populate the final glycan feature maps ---
-    for chain_name, prelim_features in all_glycan_prelim_features.items():
-        asym_id = chain_to_idx[chain_name]
-        source_idx = glycan_source_indices[chain_name]
-        local_atom_to_mono_idx_maps[asym_id] = all_glycan_atom_maps[chain_name]
-        for mono_idx, features in prelim_features.items():
-            final_key = (asym_id, mono_idx)
-            local_glycan_feature_map[final_key] = MonosaccharideFeatures(
-                asym_id=asym_id, ccd_code=features["ccd_code"],
-                source_glycan_idx=source_idx, anomeric_config=features["anomeric_config"]
-            )
-
-    # --- Step 5: Process schema-level constraints ---
-    pocket_binders, pocket_residues, glycosylation_sites_data = [], [], []
+    # --- 4. Parse Constraints (Bonds, Pockets, Glycosylation) ---
+    pocket_binders = []
+    pocket_residues = []
+    constraints = schema.get("constraints", [])
     
-    # Process legacy bond/pocket constraints
-    for constraint in schema.get("constraints", []):
+    # Explicit Bonds
+    for constraint in constraints:
         if "bond" in constraint:
-            try:
-                c1_name, r1_idx, a1_name = tuple(constraint["bond"]["atom1"])
-                c2_name, r2_idx, a2_name = tuple(constraint["bond"]["atom2"])
-                a1_global = atom_idx_map[(c1_name, r1_idx - 1, a1_name)]
-                a2_global = atom_idx_map[(c2_name, r2_idx - 1, a2_name)]
-                # This is an inter-residue bond, so it's a connection
-                connections_list.append((chain_to_idx[c1_name], chain_to_idx[c2_name], res_map[(c1_name, r1_idx - 1)], res_map[(c2_name, r2_idx - 1)], a1_global, a2_global))
-            except Exception as e:
-                raise ValueError(f"Error processing bond constraint: {e}") from e
+            if "atom1" not in constraint["bond"] or "atom2" not in constraint["bond"]:
+                raise ValueError("Bond constraint improperly specified")
+            c1, r1, a1 = tuple(constraint["bond"]["atom1"])
+            c2, r2, a2 = tuple(constraint["bond"]["atom2"])
+            c1_idx, r1_idx, a1_idx = atom_idx_map[(c1, r1 - 1, a1)]
+            c2_idx, r2_idx, a2_idx = atom_idx_map[(c2, r2 - 1, a2)]
+            connections_list.append((c1_idx, c2_idx, r1_idx, r2_idx, a1_idx, a2_idx))
+        
         elif "pocket" in constraint:
-            binder_chain_name = constraint["pocket"]["binder"]
-            if len(pocket_binders) > 0 and pocket_binders[-1] != chain_to_idx[binder_chain_name]:
-                raise ValueError("Only one pocket binder is supported!")
-            if not pocket_binders:
-                pocket_binders.append(chain_to_idx[binder_chain_name])
+            if "binder" not in constraint["pocket"] or "contacts" not in constraint["pocket"]:
+                raise ValueError("Pocket constraint improperly specified")
+            binder = constraint["pocket"]["binder"]
+            contacts = constraint["pocket"]["contacts"]
             
-            pocket_residues.extend(
-                [(chain_to_idx[c_name], r_idx - 1) for c_name, r_idx in constraint["pocket"]["contacts"]]
-            )
-            
-    # Process new glycosylation sites
+            if len(pocket_binders) > 0:
+                if pocket_binders[-1] != chain_to_idx[binder]:
+                    raise ValueError("Only one pocket binder supported!")
+                else:
+                    pocket_residues[-1].extend([(chain_to_idx[c], r - 1) for c, r in contacts])
+            else:
+                pocket_binders.append(chain_to_idx[binder])
+                pocket_residues.append([(chain_to_idx[c], r - 1) for c, r in contacts])
+        else:
+            raise ValueError(f"Invalid constraint: {constraint}")
+
+    # Glycosylation Sites (Protein-Glycan covalent bonds)
+    glycosylation_sites_data = []
     if "glycosylation" in schema:
         for site in schema.get("glycosylation", []):
             try:
-                prot_spec = site["site"]["protein"]
-                p_chain, p_res_1based, p_atom = prot_spec if len(prot_spec) == 3 else (*prot_spec, None)
+                p_spec = site["site"]["protein"]
+                p_chain, p_res_1based = p_spec[0], p_spec[1]
                 p_res_0based = p_res_1based - 1
-
-                g_chain, g_mono_0based, g_atom = site["site"]["glycan"]
                 
-                if p_atom is None:
-                    prot_global_res_idx = res_map.get((p_chain, p_res_0based))
-                    if prot_global_res_idx is not None:
-                        prot_res_name = res_data[prot_global_res_idx][0]
-                        p_atom = {"ASN": "ND2", "SER": "OG", "THR": "OG1"}.get(prot_res_name)
-                if p_atom is None:
-                    raise ValueError(f"Could not infer attachment atom for protein residue {p_chain}:{p_res_1based}")
-
-                prot_atom_global_idx = atom_idx_map.get((p_chain, p_res_0based, p_atom))
-                glycan_atom_global_idx = atom_idx_map.get((g_chain, 0, g_atom))
-
-                if prot_atom_global_idx is None or glycan_atom_global_idx is None:
-                    raise ValueError(f"Could not find atoms for glycosylation site: {site}")
-
-                # <<< FIX: REMOVE this line >>>
-                # bond_data.append((prot_atom_global_idx, glycan_atom_global_idx, const.bond_type_ids["SINGLE"]))
+                g_spec = site["site"]["glycan"]
+                g_chain, g_mono_idx, g_atom_name = g_spec[0], g_spec[1], g_spec[2]
                 
-                # <<< FIX: ADD this line >>>
-                connections_list.append((chain_to_idx[p_chain], chain_to_idx[g_chain], res_map[(p_chain, p_res_0based)], res_map[(g_chain, 0)], prot_atom_global_idx, glycan_atom_global_idx))
+                # Determine Protein Atom Name
+                if len(p_spec) == 3:
+                    p_atom_name = p_spec[2]
+                else:
+                    # Infer standard attachment point based on residue type (N-linked vs O-linked)
+                    # We need to look up the residue type. 
+                    # atom_idx_map keys are (chain, res, atom). 
+                    # We iterate the map keys (inefficient but safe) or check commonly
+                    found = False
+                    for possible_atom in ["ND2", "OG", "OG1"]: # ASN, SER, THR
+                        if (p_chain, p_res_0based, possible_atom) in atom_idx_map:
+                            p_atom_name = possible_atom
+                            found = True
+                            break
+                    if not found:
+                        raise ValueError(f"Could not infer attachment atom for {p_chain}:{p_res_1based}")
 
-                prot_chain_id_int = chain_to_idx.get(p_chain)
-                glycan_chain_id_int = chain_to_idx.get(g_chain)
-                if prot_chain_id_int is None or glycan_chain_id_int is None:
-                    raise ValueError(f"Could not find chain ID for protein '{p_chain}' or glycan '{g_chain}' in site.")
+                # Get Global Indices
+                if (p_chain, p_res_0based, p_atom_name) not in atom_idx_map:
+                    raise ValueError(f"Protein atom {p_chain}:{p_res_1based}:{p_atom_name} not found")
+                if (g_chain, g_mono_idx, g_atom_name) not in atom_idx_map:
+                    raise ValueError(f"Glycan atom {g_chain}:{g_mono_idx}:{g_atom_name} not found")
 
-                site_tuple = (prot_chain_id_int, p_res_0based, p_atom, glycan_chain_id_int, g_mono_0based, g_atom)
-                glycosylation_sites_data.append(site_tuple)
+                p_c_idx, p_r_idx, p_a_idx = atom_idx_map[(p_chain, p_res_0based, p_atom_name)]
+                g_c_idx, g_r_idx, g_a_idx = atom_idx_map[(g_chain, g_mono_idx, g_atom_name)]
+
+                connections_list.append((p_c_idx, g_c_idx, p_r_idx, g_r_idx, p_a_idx, g_a_idx))
+                
+                # Store site metadata for loss masking
+                glycosylation_sites_data.append((p_c_idx, p_res_0based, p_atom_name, g_c_idx, g_mono_idx, g_atom_name))
+
             except Exception as e:
-                raise ValueError(f"Error processing glycosylation site: {site}. Details: {e}") from e
+                raise ValueError(f"Error processing glycosylation site: {e}")
 
-    # --- Step 6: Final Assembly ---
-    structure_data = Structure(
-        atoms=np.array(atom_data, dtype=Atom),
-        bonds=np.array(sorted(list(set(bond_data))), dtype=Bond),
-        residues=np.array(res_data, dtype=Residue),
-        chains=np.array(chain_data, dtype=Chain),
-        connections=np.array(connections_list, dtype=Connection), # <<< FIX: USE the populated list
-        interfaces=np.array([], dtype=Interface),
-        mask=np.ones(len(chain_data), dtype=bool),
-        glycosylation_sites=np.array(glycosylation_sites_data, dtype=GlycosylationSite),
-        glycan_feature_map=local_glycan_feature_map,
-        atom_to_mono_idx_map=local_atom_to_mono_idx_maps,
+    # --- 5. Construct Final Objects ---
+    atoms = np.array(atom_data, dtype=Atom)
+    bonds = np.array(bond_data, dtype=Bond)
+    residues = np.array(res_data, dtype=Residue)
+    chains = np.array(chain_data, dtype=Chain)
+    interfaces = np.array([], dtype=Interface)
+    connections = np.array(connections_list, dtype=Connection)
+    mask = np.ones(len(chain_data), dtype=bool)
+    
+    # Constraints arrays
+    rdkit_bounds_constraints = np.array(rdkit_bounds_constraint_data, dtype=RDKitBoundsConstraint)
+    chiral_atom_constraints = np.array(chiral_atom_constraint_data, dtype=ChiralAtomConstraint)
+    stereo_bond_constraints = np.array(stereo_bond_constraint_data, dtype=StereoBondConstraint)
+    planar_bond_constraints = np.array(planar_bond_constraint_data, dtype=PlanarBondConstraint)
+    planar_ring_5_constraints = np.array(planar_ring_5_constraint_data, dtype=PlanarRing5Constraint)
+    planar_ring_6_constraints = np.array(planar_ring_6_constraint_data, dtype=PlanarRing6Constraint)
+
+    data = Structure(
+        atoms=atoms,
+        bonds=bonds,
+        residues=residues,
+        chains=chains,
+        connections=connections,
+        interfaces=interfaces,
+        mask=mask,
+        # New Glycan fields
+        glycosylation_sites=np.array(glycosylation_sites_data, dtype=GlycosylationSite) if glycosylation_sites_data else None,
+        glycan_feature_map=global_glycan_feature_map,
+        atom_to_mono_idx_map=global_atom_to_mono_idx_map
+    )
+
+    # Metadata
+    struct_info = StructureInfo(num_chains=len(chains))
+    chain_infos = []
+    for chain in chains:
+        chain_infos.append(ChainInfo(
+            chain_id=int(chain["asym_id"]),
+            chain_name=chain["name"],
+            mol_type=int(chain["mol_type"]),
+            cluster_id=-1,
+            msa_id=chain_to_msa[chain["name"]],
+            num_residues=int(chain["res_num"]),
+            valid=True,
+            entity_id=int(chain["entity_id"]),
+        ))
+
+    # Fix flat list of lists for pocket contacts if necessary
+    # The old code flattened `pocket_residues`. Ensure format matches `InferenceOptions` expectation.
+    # `pocket_residues` is List[List[Tuple[int, int]]]. `InferenceOptions` expects Optional[list[tuple[int, int]]] (flat).
+    # The old code's logic `pocket_residues[-1].extend` implies it keeps it flat per binder, but `InferenceOptions` usually takes a single flat list for the whole complex or one specific binder context.
+    # Given Boltz usually predicts one complex, we flatten.
+    flat_pocket_residues = [item for sublist in pocket_residues for item in sublist] if pocket_residues else None
+    
+    options = InferenceOptions(binders=pocket_binders, pocket=flat_pocket_residues)
+
+    record = Record(
+        id=name,
+        structure=struct_info,
+        chains=chain_infos,
+        interfaces=[],
+        inference_options=options,
     )
 
     residue_constraints = ResidueConstraints(
-        rdkit_bounds_constraints=np.array(rdkit_bounds_constraint_data, dtype=RDKitBoundsConstraint),
-        chiral_atom_constraints=np.array(chiral_atom_constraint_data, dtype=ChiralAtomConstraint),
-        stereo_bond_constraints=np.array(stereo_bond_constraint_data, dtype=StereoBondConstraint),
-        planar_bond_constraints=np.array(planar_bond_constraint_data, dtype=PlanarBondConstraint),
-        planar_ring_5_constraints=np.array(planar_ring_5_constraint_data, dtype=PlanarRing5Constraint),
-        planar_ring_6_constraints=np.array(planar_ring_6_constraint_data, dtype=PlanarRing6Constraint),
+        rdkit_bounds_constraints=rdkit_bounds_constraints,
+        chiral_atom_constraints=chiral_atom_constraints,
+        stereo_bond_constraints=stereo_bond_constraints,
+        planar_bond_constraints=planar_bond_constraints,
+        planar_ring_5_constraints=planar_ring_5_constraints,
+        planar_ring_6_constraints=planar_ring_6_constraints,
     )
-
-    struct_info = StructureInfo(num_chains=len(chain_data))
-    chain_infos = [
-        ChainInfo(
-            chain_id=int(c[4]), chain_name=c[0], mol_type=int(c[1]),
-            cluster_id=-1, msa_id=chain_to_msa.get(c[0], 0), num_residues=int(c[8]),
-            valid=True, entity_id=int(c[2])
-        ) for c in chain_data
-    ]
-
-    options = InferenceOptions(binders=pocket_binders, pocket=pocket_residues) if pocket_binders else None
-    record = Record(
-        id=name, structure=struct_info, chains=chain_infos,
-        interfaces=[], inference_options=options,
-    )
-
-    del blocker
 
     return Target(
         record=record,
-        structure=structure_data,
+        structure=data,
         sequences=entity_to_seq,
         residue_constraints=residue_constraints,
     )
@@ -1144,6 +1286,58 @@ def parse_standard_residue_with_bonds(
         is_present=True,
     )
 
+def _remove_atom(residue: ParsedResidue, atom_name_to_remove: str) -> ParsedResidue:
+    """
+    Physically removes an atom from a ParsedResidue and re-indexes bonds and properties.
+    Used to enforce stoichiometry (e.g. removing leaving oxygen in glycosidic bonds).
+    """
+    # 1. Find the index of the atom to remove
+    remove_idx = -1
+    for i, atom in enumerate(residue.atoms):
+        if atom.name.upper() == atom_name_to_remove.upper():
+            remove_idx = i
+            break
+    
+    if remove_idx == -1:
+        # Atom not found; assume it was already removed or not present. Return as is.
+        return residue
+
+    # 2. Build new atom list and index map
+    new_atoms = []
+    old_to_new_map = {}
+    new_counter = 0
+    
+    for i, atom in enumerate(residue.atoms):
+        if i == remove_idx:
+            continue
+        new_atoms.append(atom)
+        old_to_new_map[i] = new_counter
+        new_counter += 1
+
+    # 3. Rebuild bonds with new indices
+    new_bonds = []
+    for bond in residue.bonds:
+        # If bond involves removed atom, drop it
+        if bond.atom_1 == remove_idx or bond.atom_2 == remove_idx:
+            continue
+        # Map remaining indices
+        n1 = old_to_new_map[bond.atom_1]
+        n2 = old_to_new_map[bond.atom_2]
+        new_bonds.append(ParsedBond(min(n1, n2), max(n1, n2), bond.type))
+
+    # 4. Remap centers
+    # If center was removed, default to 0
+    new_center = old_to_new_map.get(residue.atom_center, 0) 
+    new_disto = old_to_new_map.get(residue.atom_disto, 0)
+
+    return replace(
+        residue,
+        atoms=new_atoms,
+        bonds=new_bonds,
+        atom_center=new_center,
+        atom_disto=new_disto
+    )
+
 
 # --- New helper classes and functions for branching ---
 class GlycanToken:
@@ -1198,62 +1392,60 @@ def tokenize_cyclodextrin(iupac: str) -> List[GlycanToken]:
 
     return tokens
 
-def compute_cyclodextrin_bonds(iupac: str, ccd: Mapping[str, Mol]) -> Tuple[List[ParsedResidue], List[Tuple[int, int, Tuple[str, int, int]]], Optional[int]]:
+def compute_cyclodextrin_bonds(iupac: str, ccd: Mapping[str, Mol]) -> Tuple[List[ParsedResidue], List[Tuple[int, int, Tuple[str, int, int]]]]:
     """
-    Takes the original IUPAC string, tokenizes it to find the acceptor,
-    then builds the linear/branched connections and returns the reordered residues
-    along with the stable original index of the acceptor.
+    Parses a cyclodextrin IUPAC string with anomer correction.
     """
-    # /-------------------------- THE ONLY CHANGE IS THIS ONE LINE --------------------------/
     tokens = tokenize_cyclodextrin(iupac)
-    # /------------------------------------ END OF FIX ------------------------------------/
-    
     residues: List[ParsedResidue] = []
     
-    cyclic_acceptor_original_idx: Optional[int] = None
-
+    # 1. Create Residue Objects
     for token in tokens:
         if token.type == 'residue':
             idx = len(residues)
             token.residue_index = idx
-            if token.is_cyclic_acceptor:
-                cyclic_acceptor_original_idx = idx
-
-            if token.value not in ccd:
-                raise ValueError(f"CCD structure for glycan residue '{token.value}' not found!")
-            res = parse_ccd_residue(token.value, ccd[token.value], res_idx=idx)
-            if res is None:
-                 raise ValueError(f"Failed to parse CCD residue '{token.value}'")
+            
+            # Use the map from const.py to find the reference sugar
+            # E.g. token="BMA" -> lookup="MAN"
+            lookup_name = const.ANOMER_REF_MAP.get(token.value, token.value)
+            
+            # Ensure the lookup name exists in the CCD
+            if lookup_name not in ccd:
+                 # Fallback to token value if lookup fails (e.g. map mismatch)
+                 lookup_name = token.value
+            
+            if lookup_name not in ccd:
+                raise ValueError(f"CCD code '{lookup_name}' (mapped from '{token.value}') not found.")
+            
+            # Parse using the Reference Molecule (lookup_name) but the Original Name (token.value)
+            # This ensures we get the 'MAN' conformer for 'BMA'
+            res = parse_ccd_residue(token.value, ccd[lookup_name], res_idx=idx)
             residues.append(res)
 
+    # 2. Parse Linear Connections (Stack-based)
     stack: List[GlycanToken] = []
     connections: List[Tuple[int, int, Tuple[str, int, int]]] = []
-    connect_tokens = [t for t in tokens if t.type in ('residue', 'open', 'close')]
+    
+    linear_tokens = [t for t in tokens if t.type in ('residue', 'open', 'close')]
 
-    for token in reversed(connect_tokens):
+    for token in reversed(linear_tokens):
         if token.type == 'residue':
             if not stack:
                 stack.append(token)
             else:
                 if token.bond_spec is not None:
                     if stack and stack[-1].type == 'close':
-                        stack.pop()
-                        if not stack or stack[-1].type != 'residue':
-                            raise ValueError("Malformed glycan string: expected residue below close bracket.")
+                        stack.pop() # Remove ']'
                         target = stack[-1]
                         connections.append((target.residue_index, token.residue_index, token.bond_spec))
-                        stack.append(target)
+                        stack.append(target) 
                         stack.append(token)
                     elif stack and stack[-1].type == 'residue':
                         target = stack[-1]
                         connections.append((target.residue_index, token.residue_index, token.bond_spec))
                         stack.pop()
                         stack.append(token)
-                    else:
-                        raise ValueError(f"Malformed glycan string: unexpected token {stack[-1].type if stack else 'empty'} after residue {token.value}")
                 else:
-                     if stack and stack[-1].type == 'residue':
-                         raise ValueError(f"Residue '{token.value}' is missing bond specification but is followed by '{stack[-1].value}'.")
                      stack.append(token)
         elif token.type == 'close':
             stack.append(token)
@@ -1263,20 +1455,28 @@ def compute_cyclodextrin_bonds(iupac: str, ccd: Mapping[str, Mol]) -> Tuple[List
             if stack and stack[-1].type == 'close':
                 stack.pop()
 
-    if not residues:
-        return [], [], None
+    # 3. Parse Cyclic Connection
+    cyclic_match = re.search(r'(\w+)\(([abAB])(\d+)-(\d+)\)\s*\}$', iupac)
+    if not cyclic_match:
+        raise ValueError(f"Could not parse cyclic bond specification from: {iupac}")
+
+    alpha_beta = cyclic_match.group(2).lower()
+    donor_num = int(cyclic_match.group(3))
+    acceptor_num = int(cyclic_match.group(4))
+    cyclic_bond_spec = (alpha_beta, donor_num, acceptor_num)
+
+    donor_token = next(t for t in tokens if t.type == 'residue' and t.residue_index == 0)
+    acceptor_token = next(t for t in tokens if t.is_cyclic_acceptor)
     
-    num_residues = len(residues)
-    if not connections:
-        return residues, [], cyclic_acceptor_original_idx
+    connections.append((acceptor_token.residue_index, donor_token.residue_index, cyclic_bond_spec))
 
-    child_indices = {c[1] for c in connections}
-    root_candidates = [i for i in range(num_residues) if i not in child_indices]
-    if len(root_candidates) != 1:
-        raise ValueError(f"Glycan parsing error: Found {len(root_candidates)} possible roots. Expected 1.")
-    root_idx = root_candidates[0]
+    # 4. Reorder residues to be root-first (BFS)
+    if not residues:
+        return [], []
 
-    adj = {i: [] for i in range(num_residues)}
+    root_idx = 0 
+    
+    adj = {i: [] for i in range(len(residues))}
     for p, c, _ in connections:
         adj[p].append(c)
 
@@ -1294,81 +1494,126 @@ def compute_cyclodextrin_bonds(iupac: str, ccd: Mapping[str, Mol]) -> Tuple[List
 
     reordered_residues = [residues[i] for i in new_order_indices]
     old_to_new_idx_map = {old_idx: new_idx for new_idx, old_idx in enumerate(new_order_indices)}
-    reordered_connections = [(old_to_new_idx_map[p], old_to_new_idx_map[c], spec) for p, c, spec in connections]
+    
+    reordered_connections = [
+        (old_to_new_idx_map[p], old_to_new_idx_map[c], spec)
+        for p, c, spec in connections
+    ]
 
-    return reordered_residues, reordered_connections, cyclic_acceptor_original_idx
-
+    return reordered_residues, reordered_connections
 
 def tokenize_glycan(iupac: str) -> List[GlycanToken]:
     """
-    Tokenize the glycan IUPAC string into monosaccharide tokens (with optional bond spec including alpha/beta)
-    and branch markers (i.e. '[' and ']').
+    Tokenize the glycan IUPAC string into monosaccharide tokens and branch markers.
+    
+    CRITICAL CHANGE: This regex now strictly enforces that if parentheses exist 
+    after a residue code, they MUST contain linkage numbers (e.g. 'a1-4'). 
+    It will NOT match 'NAG(a)' or 'NAG(b)'. Those Root cases must be handled 
+    by pre-processing in compute_branching_bonds.
     """
-    # Modified pattern to capture alpha/beta char in group 2, donor in 3, acceptor in 4
-    pattern = re.compile(r'([A-Z0-9]+)(?:\(([abAB])(\d+)-(\d+)\))?|([\[\]])')
+    # Regex Breakdown:
+    # 1. ([A-Z0-9]+)\(([abAB])(\d+)-(\d+)\) 
+    #    -> Matches Code + Anomer + Donor + Acceptor (digits MANDATORY)
+    # 2. ([A-Z0-9]+)
+    #    -> Matches Code only (e.g. GAL)
+    # 3. ([\[\]])
+    #    -> Matches Brackets
+    
+    pattern = re.compile(r'([A-Z0-9]+)\(([abAB])(\d+)-(\d+)\)|([A-Z0-9]+)|([\[\]])')
+    
     tokens = []
     pos = 0
     while pos < len(iupac):
         match = pattern.match(iupac, pos)
         if not match:
-            raise ValueError(f"Could not parse IUPAC string starting at: {iupac[pos:]}")
+            # Diagnostic snippet
+            snippet = iupac[pos:pos+10]
+            raise ValueError(f"Could not parse IUPAC string starting at: {snippet}...")
 
-        if match.group(1): # Matched a residue code (potentially with bond spec)
+        # Case 1: Residue WITH Full Bond Spec (e.g. BMA(b1-4))
+        if match.group(1):
             code = match.group(1)
-            bond_spec = None
-            if match.group(2): # Bond spec exists
-                alpha_beta = match.group(2).lower() # Capture 'a' or 'b'
-                donor_num = int(match.group(3))
-                acceptor_num = int(match.group(4))
-                bond_spec = (alpha_beta, donor_num, acceptor_num)
+            alpha_beta = match.group(2).lower()
+            donor_num = int(match.group(3))
+            acceptor_num = int(match.group(4))
+            
+            bond_spec = (alpha_beta, donor_num, acceptor_num)
             tokens.append(GlycanToken('residue', code, bond_spec))
-            pos = match.end() # Advance past the whole match including bond spec
-        elif match.group(5): # Matched a bracket
-            symbol = match.group(5)
+            pos = match.end()
+
+        # Case 2: Residue WITHOUT Bond Spec (e.g. BMA)
+        elif match.group(5):
+            code = match.group(5)
+            tokens.append(GlycanToken('residue', code, None))
+            pos = match.end()
+
+        # Case 3: Bracket
+        elif match.group(6):
+            symbol = match.group(6)
             if symbol == '[':
                 tokens.append(GlycanToken('open', symbol))
             elif symbol == ']':
                 tokens.append(GlycanToken('close', symbol))
-            pos = match.end() # Advance past the bracket
+            pos = match.end()
+            
         else:
-             # This case should ideally not be reached if the regex covers all possibilities
              raise ValueError(f"Unexpected parsing state at: {iupac[pos:]}")
 
     return tokens
 
 
-def compute_branching_bonds(iupac: str, ccd: Mapping[str, Mol]) -> Tuple[List[ParsedResidue], List[Tuple[int, int, Tuple[str, int, int]]]]:
+def compute_branching_bonds(iupac: str, ccd: Mapping[str, Mol]) -> Tuple[List[ParsedResidue], List[Tuple[int, int, Tuple[str, int, int]]], Optional[Tuple[str, int, int]]]:
     """
-    Implements the branching heuristic. It now reorders the output residues
-    to be in a root-first traversal order for more intuitive file outputs,
-    without changing the underlying chemical topology.
+    Implements the branching heuristic with robust Anomer detection.
+    
+    It separates the processing of the Root Anomer (e.g. 'NAG(a)') from the 
+    rest of the chain. This avoids regex ambiguity and ensures the 'a' or 'b' 
+    config is correctly preserved as the `root_bond_spec`.
+    """
+    
+    # 1. Detect and Strip Root Anomer Config manually
+    #    We look for '(a)' or '(b)' at the very end of the string.
+    root_anomer_match = re.search(r'\(([abAB])\)$', iupac.strip())
+    
+    root_override_spec = None
+    clean_iupac = iupac
+    
+    if root_anomer_match:
+        # Capture the config (e.g. 'a')
+        anomer_char = root_anomer_match.group(1).lower()
+        # Create a partial spec (digits are None for root)
+        root_override_spec = (anomer_char, None, None)
+        # Strip the suffix from the string so the strict tokenizer processes the residue as just "NAG"
+        clean_iupac = iupac[:root_anomer_match.start()]
 
-    Returns:
-      - a list of residues (in root-first traversal order)
-      - a list of connections, where each connection is a tuple:
-            (parent_residue_index, child_residue_index, bond_spec)
-        bond_spec is (alpha_beta_char, donor_num, acceptor_num) e.g. ('a', 1, 6).
-    """
-    tokens = tokenize_glycan(iupac)
+    # 2. Tokenize the cleaned string
+    tokens = tokenize_glycan(clean_iupac)
     residues: List[ParsedResidue] = []
-    residue_tokens = [] # Keep track of just the residue tokens for indexing
-
+    
+    # 3. Create Residue Objects
     for token in tokens:
         if token.type == 'residue':
             idx = len(residues)
             token.residue_index = idx
-            if token.value not in ccd:
-                raise ValueError(f"CCD structure for glycan residue '{token.value}' not found!")
-            # Ensure res_idx is set correctly during initial parsing (used for chain index later)
-            res = parse_ccd_residue(token.value, ccd[token.value], res_idx=idx)
+            
+            # Lookup Reference
+            lookup_name = const.ANOMER_REF_MAP.get(token.value, token.value)
+            
+            if lookup_name not in ccd:
+                 lookup_name = token.value
+
+            if lookup_name not in ccd:
+                raise ValueError(f"CCD structure for glycan residue '{lookup_name}' (mapped from '{token.value}') not found!")
+            
+            # Parse
+            res = parse_ccd_residue(token.value, ccd[lookup_name], res_idx=idx)
             if res is None:
                  raise ValueError(f"Failed to parse CCD residue '{token.value}'")
             residues.append(res)
-            residue_tokens.append(token) # Add to the list maintaining order
 
-    # Now process the tokens in reverse (right-to-left) with a stack
+    # 4. Parse Connections (Right-to-Left Stack)
     stack: List[GlycanToken] = []
-    connections: List[Tuple[int, int, Tuple[str, int, int]]] = [] # Store full bond spec
+    connections: List[Tuple[int, int, Tuple[str, int, int]]] = [] 
 
     for token in reversed(tokens):
         if token.type == 'residue':
@@ -1376,6 +1621,7 @@ def compute_branching_bonds(iupac: str, ccd: Mapping[str, Mol]) -> Tuple[List[Pa
                 stack.append(token)
             else:
                 if token.bond_spec is not None:
+                    # Internal nodes MUST have full linkage spec (digits included)
                     if stack and stack[-1].type == 'close':
                         close_token = stack.pop()
                         if not stack or stack[-1].type != 'residue':
@@ -1393,6 +1639,8 @@ def compute_branching_bonds(iupac: str, ccd: Mapping[str, Mol]) -> Tuple[List[Pa
                     else:
                         raise ValueError(f"Malformed glycan string: unexpected token {stack[-1].type if stack else 'empty'} after residue {token.value}")
                 else:
+                     # No bond spec. This is valid for the Root (bottom of stack), 
+                     # but invalid if found mid-stream followed by another residue.
                      if stack:
                           if stack[-1].type == 'residue':
                               raise ValueError(f"Residue '{token.value}' (index {token.residue_index}) is missing bond specification but is followed by '{stack[-1].value}'.")
@@ -1406,22 +1654,24 @@ def compute_branching_bonds(iupac: str, ccd: Mapping[str, Mol]) -> Tuple[List[Pa
             if stack and stack[-1].type == 'close':
                 stack.pop()
 
-    # --- NEW LOGIC: Reorder residues to be root-first (cosmetic change) ---
+    # 5. Reorder residues to be root-first (BFS)
     if not residues:
-        return [], []
+        return [], [], None
     
     num_residues = len(residues)
-    if not connections: # Handle single monosaccharide case
-        return residues, []
+    
+    # Identify Root
+    if not connections: 
+        # Single residue case
+        root_idx = 0 
+    else:
+        child_indices = {c[1] for c in connections}
+        root_candidates = [i for i in range(num_residues) if i not in child_indices]
+        if len(root_candidates) != 1:
+            raise ValueError(f"Glycan parsing error: Found {len(root_candidates)} possible roots. Expected 1.")
+        root_idx = root_candidates[0]
 
-    # 1. Find the root (the only node that is never a child)
-    child_indices = {c[1] for c in connections}
-    root_candidates = [i for i in range(num_residues) if i not in child_indices]
-    if len(root_candidates) != 1:
-        raise ValueError(f"Glycan parsing error: Found {len(root_candidates)} possible roots. Expected 1.")
-    root_idx = root_candidates[0]
-
-    # 2. Perform a Breadth-First Search (BFS) to get a root-first ordering
+    # BFS Reorder
     adj = {i: [] for i in range(num_residues)}
     for p, c, _ in connections:
         adj[p].append(c)
@@ -1433,510 +1683,218 @@ def compute_branching_bonds(iupac: str, ccd: Mapping[str, Mol]) -> Tuple[List[Pa
     while queue:
         parent_idx = queue.pop(0)
         new_order_indices.append(parent_idx)
-        for child_idx in sorted(adj.get(parent_idx, [])): # Sort for deterministic output
+        for child_idx in sorted(adj.get(parent_idx, [])): 
             if child_idx not in visited:
                 visited.add(child_idx)
                 queue.append(child_idx)
 
-    # 3. Create the reordered list of residues
     reordered_residues = [residues[i] for i in new_order_indices]
-
-    # 4. Create a map from old indices to new indices
     old_to_new_idx_map = {old_idx: new_idx for new_idx, old_idx in enumerate(new_order_indices)}
-
-    # 5. Update the connection indices to match the new residue order
     reordered_connections = [
         (old_to_new_idx_map[p], old_to_new_idx_map[c], spec)
         for p, c, spec in connections
     ]
 
-    return reordered_residues, reordered_connections
-
-
-
-def _parse_cyclic_bond_from_original_iupac(
-    original_iupac: str,
-    residues: List[ParsedResidue],
-    iupac_res_names: List[str],
-    acceptor_original_idx: int
-) -> Tuple[int, int, Tuple[str, int, int]]:
-    bond_spec_match = re.search(r'(\w+)\(([abAB])(\d+)-(\d+)\)\s*\}$', original_iupac)
-    if not bond_spec_match:
-        raise ValueError(f"Could not parse cyclic bond specification from: {original_iupac}")
-
-    alpha_beta = bond_spec_match.group(2).lower()
-    donor_num = int(bond_spec_match.group(3))
-    acceptor_num = int(bond_spec_match.group(4))
-    cyclic_bond_spec = (alpha_beta, donor_num, acceptor_num)
-
-    donor_idx = 0
-    donor_name = iupac_res_names[-1]
-    if residues[donor_idx].name != donor_name:
-         raise ValueError(f"Cyclodextrin root residue mapping failed. Expected {donor_name}, found {residues[donor_idx].name}.")
-
-    try:
-        acceptor_reordered_idx = next(i for i, r in enumerate(residues) if r.idx == acceptor_original_idx)
-    except StopIteration:
-        raise ValueError(f"Logic error: Could not find the flagged acceptor residue (original index {acceptor_original_idx}) in the reordered list.")
+    # 6. Determine Final Root Bond Spec
+    # If we stripped an override (e.g. NAG(a)), use it.
+    # Otherwise, check the token itself (e.g. NAG(a1-4) where root is a donor fragment).
+    root_bond_spec = root_override_spec
     
-    acceptor_idx = acceptor_reordered_idx
-    return (acceptor_idx, donor_idx, cyclic_bond_spec)
+    if root_bond_spec is None:
+        for t in tokens:
+            if t.type == 'residue' and t.residue_index == root_idx:
+                root_bond_spec = t.bond_spec
+                break
 
-def relax_glycan_structure(
-    chains: Dict[str, ParsedChain],
-    chain_connections: List[Tuple[str, str, ParsedBond]]
-) -> Dict[str, ParsedChain]:
+    return reordered_residues, reordered_connections, root_bond_spec
+
+def _build_adjacency_from_parsed(residue: ParsedResidue) -> Dict[int, List[int]]:
+    """Builds an adjacency list from a ParsedResidue's bond list."""
+    adj = {}
+    # Initialize all atom indices
+    for i in range(len(residue.atoms)):
+        adj[i] = []
+    
+    for bond in residue.bonds:
+        adj[bond.atom_1].append(bond.atom_2)
+        adj[bond.atom_2].append(bond.atom_1)
+    return adj
+
+def _find_ring_atom_names(residue: ParsedResidue) -> set[str]:
     """
-    Merge all provided chains into a temporary RDKit molecule, perform a 
-    force-field relaxation, and update the coordinate information in the original
-    ParsedChain objects.
-
-    In the single-chain glycan model, this function is called with a single chain
-    representing the entire glycan and an empty list of connections.
-
-    Parameters:
-        chains: A dictionary mapping chain names to ParsedChain objects.
-        chain_connections: A list representing inter-chain bonds (obsolete for single-chain glycans).
-
-    Returns:
-        The updated chains dictionary with relaxed coordinates.
+    Finds atoms in the ring using the exact DFS logic from the training script.
+    Returns a set of atom names (e.g., {'C1', 'C2', 'C3', 'C4', 'C5', 'O5'}).
     """
-    blocker = rdBase.BlockLogs()
-
-    merged_mol = Chem.RWMol()
-    # Maps (chain_name, local_atom_index_in_residue) to merged_mol atom index.
-    mapping: Dict[Tuple[str, int], int] = {}
-
-    # Add atoms from each chain's residue(s).
-    for chain_name, chain in chains.items():
-        if not chain.residues: continue
-        # Note: This handles both single large glycan residues and multi-residue chains.
-        for residue in chain.residues:
-            for local_idx, atom in enumerate(residue.atoms):
-                rd_atom = Chem.Atom(atom.element)
-                rd_atom.SetFormalCharge(atom.charge)
-                rd_idx = merged_mol.AddAtom(rd_atom)
-                # The key must be unique per atom. We use chain_name and its global atom index
-                # from the original structure as a unique key during mapping.
-                # Let's assume the local_idx within the residue is sufficient if chain names are unique.
-                mapping[(chain_name, local_idx)] = rd_idx
-
-    # Add all internal bonds for each chain.
-    for chain_name, chain in chains.items():
-        if not chain.residues: continue
-        residue = chain.residues[0] # Assuming one residue per chain for simplicity here
-        for bond in residue.bonds:
-            key1 = (chain_name, bond.atom_1)
-            key2 = (chain_name, bond.atom_2)
-            if key1 in mapping and key2 in mapping:
-                idx1, idx2 = mapping[key1], mapping[key2]
-                # FIX: All bonds in glycans are single bonds. This removes the dependency on the non-existent const attribute.
-                rd_bond_type = Chem.BondType.SINGLE
-                if merged_mol.GetBondBetweenAtoms(idx1, idx2) is None:
-                    try:
-                        merged_mol.AddBond(idx1, idx2, rd_bond_type)
-                    except RuntimeError:
-                        print(f"[relax] RDKit failed to add bond between atoms {idx1}-{idx2} for chain {chain_name}")
-
-
-    # Create a conformer and set the initial coordinates.
-    if merged_mol.GetNumAtoms() == 0:
-        del blocker
-        return chains
-
-    conf = Chem.Conformer(merged_mol.GetNumAtoms())
-    for (chain_name, local_idx), rd_idx in mapping.items():
-        if chain_name in chains and chains[chain_name].residues:
-            atom = chains[chain_name].residues[0].atoms[local_idx]
-            # Use the idealized conformer coordinates to build the molecule for relaxation
-            x, y, z = atom.conformer
-            conf.SetAtomPosition(rd_idx, (x, y, z))
-
-    merged_mol.AddConformer(conf, assignId=True)
-
-    # --- Perform Relaxation ---
-    try:
-        Chem.SanitizeMol(merged_mol, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_SETAROMATICITY, catchErrors=True)
-        # Try UFF first
-        uff_code = AllChem.UFFOptimizeMolecule(merged_mol, maxIters=500)
-        if uff_code != 0: # 0 is success, 1 is not converged
-            # Try MMFF as a fallback
-            if AllChem.MMFFHasAllMoleculeParams(merged_mol):
-                AllChem.MMFFOptimizeMolecule(merged_mol, maxIters=500)
-            else:
-                print(f"[relax] UFF failed/not converged and MMFF parameters not available for a molecule.")
-    except Exception as e:
-        print(f"[relax] Warning: RDKit sanitization or relaxation failed: {e}")
-
-    # Extract the final coordinates and update the original ParsedAtom objects.
-    if merged_mol.GetNumConformers() > 0:
-        final_conf = merged_mol.GetConformer(0)
-        for (chain_name, local_idx), rd_idx in mapping.items():
-            if chain_name in chains and chains[chain_name].residues and 0 <= local_idx < len(chains[chain_name].residues[0].atoms):
-                pos = final_conf.GetAtomPosition(rd_idx)
-                atom = chains[chain_name].residues[0].atoms[local_idx]
-                
-                updated_atom = ParsedAtom(
-                    name=atom.name, element=atom.element, charge=atom.charge,
-                    # Preserve the original ground truth coordinates
-                    coords=atom.coords,
-                    # Update only the conformer with the new relaxed coordinates
-                    conformer=(pos.x, pos.y, pos.z),
-                    is_present=atom.is_present, chirality=atom.chirality,
-                )
-                chains[chain_name].residues[0].atoms[local_idx] = updated_atom
-
-    del blocker
-    return chains
-
-def stitch_monosaccharides(parent: ParsedResidue, child: ParsedResidue, bond_spec: tuple[str, int, int]) -> tuple[ParsedResidue, ParsedBond]:
-    """
-    Rigidly translate child based on parent acceptor and child donor atoms derived from bond_spec.
-    Removes donor oxygen from the child and returns the transformed child and the glycosidic bond definition.
-
-    Args:
-        parent: The parent ParsedResidue.
-        child: The child ParsedResidue to be transformed.
-        bond_spec: Tuple (alpha_beta_char, donor_num, acceptor_num), e.g., ('a', 1, 4). Alpha/beta not used for geometry here.
-
-    Returns:
-        - The transformed and processed child ParsedResidue.
-        - A ParsedBond representing the glycosidic bond (using local indices before O removal for child donor C).
-    """
-    alpha_beta, donor_num, acceptor_num = bond_spec # Unpack the full spec
-    donor_atom_name = f"C{donor_num}"
-    acceptor_atom_name = f"O{acceptor_num}"
-    oxygen_to_remove_name = f"O{donor_num}" # Assume O matches C number for removal
-
-    # --- Find Donor Atom (Child - Carbon) using CONFORMER coordinates ---
-    donor_idx = -1
-    donor_conformer_coord = None
-    for i, atom in enumerate(child.atoms):
-        # Use upper() for case-insensitive matching, although CCD names should be consistent
-        if atom.name.upper() == donor_atom_name.upper():
-            donor_idx = i
-            donor_conformer_coord = np.array(atom.conformer)
-            break
-    if donor_idx == -1:
-        atom_names = [a.name for a in child.atoms]
-        raise ValueError(f"[stitch] Donor atom {donor_atom_name} not found in child {child.name}. Atoms: {atom_names}")
-
-    # --- Find Acceptor Atom (Parent) using CONFORMER coordinates ---
-    acceptor_idx = -1
-    acceptor_conformer_coord = None
-    for i, atom in enumerate(parent.atoms):
-        if atom.name.upper() == acceptor_atom_name.upper():
-            acceptor_idx = i
-            acceptor_conformer_coord = np.array(atom.conformer)
-            break
-    if acceptor_idx == -1:
-        atom_names = [a.name for a in parent.atoms]
-        raise ValueError(f"[stitch] Acceptor atom {acceptor_atom_name} not found in parent {parent.name}. Atoms: {atom_names}")
-
-    # --- Calculate Target Position for Donor ---
-    v_donor_to_acceptor = acceptor_conformer_coord - donor_conformer_coord
-    dist = np.linalg.norm(v_donor_to_acceptor)
-    unit_v = v_donor_to_acceptor / dist if dist > 1e-6 else np.array([1.0, 0.0, 0.0])
-    bond_length = 1.4 # Target glycosidic bond length
-    target_donor_position = acceptor_conformer_coord - unit_v * bond_length
-
-    # --- Calculate Translation Vector ---
-    translation = target_donor_position - donor_conformer_coord
-
-    # --- Apply Translation RIGIDLY to all Child Atoms (Temporary list) ---
-    translated_atoms_temp = []
-    for original_atom in child.atoms:
-        new_conformer_position = np.array(original_atom.conformer) + translation
-        translated_atoms_temp.append(
-            ParsedAtom(
-                name=original_atom.name, element=original_atom.element, charge=original_atom.charge,
-                coords=original_atom.coords,  # Preserve original ground truth
-                conformer=tuple(new_conformer_position),  # Update idealized conformer
-                is_present=original_atom.is_present, chirality=original_atom.chirality
-            )
-        )
-
-    # --- Find and Remove the Donor Oxygen (O{donor_num}) ---
-    oxygen_to_remove_idx = -1
-    for i, atom in enumerate(translated_atoms_temp):
-        if atom.name.upper() == oxygen_to_remove_name.upper():
-            oxygen_to_remove_idx = i
-            break
-
-    final_atoms = []
-    idx_map = {} # old index -> new index
-    new_idx_counter = 0
-    original_num_atoms = len(translated_atoms_temp)
-
-    if oxygen_to_remove_idx != -1:
-        # print(f"[stitch] Removing oxygen '{oxygen_to_remove_name}' (idx {oxygen_to_remove_idx}) from {child.name}")
-        for i, atom in enumerate(translated_atoms_temp):
-            if i == oxygen_to_remove_idx:
-                continue
-            final_atoms.append(atom)
-            idx_map[i] = new_idx_counter
-            new_idx_counter += 1
-    else:
-        # print(f"[stitch] Warning: Oxygen '{oxygen_to_remove_name}' not found in {child.name}. Proceeding without removal.")
-        final_atoms = translated_atoms_temp # No atoms removed
-        idx_map = {i: i for i in range(original_num_atoms)} # Identity map
-
-    # --- Update Bond Indices ---
-    final_bonds = []
-    if oxygen_to_remove_idx != -1: # Only remap if oxygen was actually removed
-        for bond in child.bonds:
-            if bond.atom_1 == oxygen_to_remove_idx or bond.atom_2 == oxygen_to_remove_idx:
-                continue # Skip bonds involving the removed oxygen
-            try:
-                new_a1 = idx_map[bond.atom_1]
-                new_a2 = idx_map[bond.atom_2]
-                final_bonds.append(ParsedBond(min(new_a1, new_a2), max(new_a1, new_a2), bond.type))
-            except KeyError:
-                 print(f"[stitch] Warning: Could not remap bond {bond} for {child.name} after O removal.")
-    else:
-        final_bonds = child.bonds # Bonds remain unchanged if no oxygen removed
-
-    # --- Update atom_center and atom_disto indices ---
-    new_atom_center = idx_map.get(child.atom_center, 0) # Default to 0 if original center removed or not found
-    new_atom_disto = idx_map.get(child.atom_disto, 0)   # Default to 0 if original disto removed or not found
-    if child.atom_center == oxygen_to_remove_idx: print(f"[stitch] Warning: Center atom was removed oxygen for {child.name}")
-    if child.atom_disto == oxygen_to_remove_idx: print(f"[stitch] Warning: Disto atom was removed oxygen for {child.name}")
-
-    # --- Construct Final Processed Child Residue ---
-    processed_child = ParsedResidue(
-        name=child.name, type=child.type, idx=child.idx, # Keep original residue index from compute_branching_bonds
-        atoms=final_atoms, bonds=final_bonds,
-        orig_idx=child.orig_idx, # This should be the index from compute_branching_bonds
-        atom_center=new_atom_center, atom_disto=new_atom_disto,
-        is_standard=child.is_standard, is_present=child.is_present
-    )
-
-    # --- Create Glycosidic Bond Definition (using original local indices) ---
-    glyco_bond = ParsedBond(
-        atom_1=acceptor_idx, # Local index in parent
-        atom_2=donor_idx,    # Local index of donor CARBON in child (before O removal)
-        type=const.bond_type_ids.get("glycosidic", const.bond_type_ids[const.unk_bond_type]) # Or SINGLE?
-    )
-
-    return processed_child, glyco_bond
-
-def _delete_anomeric_oxygen(child_residue: ParsedResidue, donor_c_num: int) -> ParsedResidue:
-    oxygen_to_remove_name = f"O{donor_c_num}"
-
-    oxygen_to_remove_idx = -1
-    for i, atom in enumerate(child_residue.atoms):
-        if atom.name.upper() == oxygen_to_remove_name.upper():
-            oxygen_to_remove_idx = i
-            break
-
-    if oxygen_to_remove_idx == -1:
-        return child_residue
-
-    final_atoms = []
-    idx_map = {}
-    new_idx_counter = 0
-    for i, atom in enumerate(child_residue.atoms):
-        if i == oxygen_to_remove_idx:
+    graph = _build_adjacency_from_parsed(residue)
+    visited = set()
+    
+    # Sort keys for deterministic behavior
+    for start_node in sorted(graph.keys()):
+        if start_node in visited:
             continue
-        final_atoms.append(atom)
-        idx_map[i] = new_idx_counter
-        new_idx_counter += 1
-
-    final_bonds = []
-    for bond in child_residue.bonds:
-        if bond.atom_1 == oxygen_to_remove_idx or bond.atom_2 == oxygen_to_remove_idx:
-            continue
-        try:
-            new_a1 = idx_map[bond.atom_1]
-            new_a2 = idx_map[bond.atom_2]
-            final_bonds.append(ParsedBond(min(new_a1, new_a2), max(new_a1, new_a2), bond.type))
-        except KeyError:
-            pass
-
-    new_atom_center = idx_map.get(child_residue.atom_center, 0)
-    new_atom_disto = idx_map.get(child_residue.atom_disto, 0)
-
-    return replace(child_residue,
-                   atoms=final_atoms,
-                   bonds=final_bonds,
-                   atom_center=new_atom_center,
-                   atom_disto=new_atom_disto)
-
-def parse_glycan(iupac: str, ccd: Mapping[str, Mol]) -> Tuple[Optional[ParsedResidue], Optional[Dict[int, dict]], Optional[np.ndarray]]:
-    """
-    Parses a glycan IUPAC string by dispatching to the correct specialized parser.
-    - For regular/branched glycans, it uses the original, unmodified logic.
-    - For cyclodextrins, it uses a new, dedicated pathway.
-    This ensures complete logical separation and correctness for both cases.
-    """
-    original_iupac = iupac
-    is_cyclodextrin = '{' in iupac
-
-    if is_cyclodextrin:
-        # --- CYCLODEXTRIN PATH ---
-        try:
-            # 1. Call the NEW, dedicated cyclodextrin parser
-            residues, connections, cyclic_acceptor_original_idx = compute_cyclodextrin_bonds(original_iupac, ccd)
-        except ValueError as e:
-            raise ValueError(f"Error parsing cyclodextrin IUPAC '{iupac}' during branching: {e}") from e
-
-        if not residues:
-            return None, None, None
-        
-        if cyclic_acceptor_original_idx is None:
-            raise ValueError("Detected cyclodextrin notation '{}' but could not identify the acceptor residue.")
-        
-        # 2. Add the cyclic bond
-        # We need the original order of names for the donor check
-        sanitized_iupac = original_iupac.replace('{', '').replace('}', '')
-        iupac_res_names = [t.value for t in tokenize_glycan(sanitized_iupac) if t.type == 'residue']
-        
-        cyclic_connection = _parse_cyclic_bond_from_original_iupac(original_iupac, residues, iupac_res_names, cyclic_acceptor_original_idx)
-        connections.append(cyclic_connection)
-
-        # 3. Perform the robust two-pass modification and bond creation
-        # PASS 1: Modify all donor residues
-        residue_mods = {i: res for i, res in enumerate(residues)}
-        for _, child_idx, bond_spec in connections:
-            child_res_to_modify = residue_mods[child_idx]
-            _, donor_c_num, _ = bond_spec
-            modified_child = _delete_anomeric_oxygen(child_res_to_modify, donor_c_num)
-            residue_mods[child_idx] = modified_child
-        
-        processed_residues = [residue_mods[i] for i in range(len(residues))]
-
-        # PASS 2: Determine local indices for bonds from the final residue states
-        glycosidic_bonds_local = []
-        for parent_idx, child_idx, bond_spec in connections:
-            parent_res = processed_residues[parent_idx]
-            child_res = processed_residues[child_idx]
-            _, donor_c_num, acceptor_o_num = bond_spec
-            donor_atom_name = f"C{donor_c_num}"
-            acceptor_atom_name = f"O{acceptor_o_num}"
-
-            try:
-                donor_c_idx_local = next(i for i, a in enumerate(child_res.atoms) if a.name.upper() == donor_atom_name.upper())
-                acceptor_o_idx_local = next(i for i, a in enumerate(parent_res.atoms) if a.name.upper() == acceptor_atom_name.upper())
-            except StopIteration:
-                raise ValueError(f"Could not find atoms for bond between {parent_res.name} and {child_res.name}") from None
             
-            glycosidic_bonds_local.append((parent_idx, child_idx, ParsedBond(acceptor_o_idx_local, donor_c_idx_local, const.bond_type_ids["SINGLE"])))
+        # Stack: (current_node, parent_node, path_list)
+        stack = [(start_node, -1, [start_node])]
         
-        # 4. Aggregate into a single residue (NO relaxation)
-        master_atoms, master_bonds, atom_to_mono_idx_list, atom_offsets = [], [], [], {}
-        current_offset = 0
-        for mono_idx, res in enumerate(processed_residues):
-            num_atoms_in_mono = len(res.atoms)
-            atom_offsets[mono_idx] = current_offset
-            master_atoms.extend(res.atoms)
-            atom_to_mono_idx_list.extend([mono_idx] * num_atoms_in_mono)
-            for bond in res.bonds:
-                master_bonds.append(ParsedBond(bond.atom_1 + current_offset, bond.atom_2 + current_offset, bond.type))
-            current_offset += num_atoms_in_mono
+        while stack:
+            curr, parent, path = stack.pop()
+            
+            if curr not in visited:
+                visited.add(curr)
+                
+            for neighbor in sorted(graph[curr]):
+                if neighbor == parent:
+                    continue
+                
+                if neighbor in path:
+                    # Cycle detected
+                    cycle_start_index = path.index(neighbor)
+                    cycle_path_indices = path[cycle_start_index:]
+                    
+                    # Basic chemical ring filter (usually 5 or 6 atoms for sugars)
+                    if len(cycle_path_indices) >= 3:
+                        return {residue.atoms[idx].name.upper() for idx in cycle_path_indices}
+                else:
+                    stack.append((neighbor, curr, path + [neighbor]))
+    
+    return set()
 
-        single_bond_type = const.bond_type_ids["SINGLE"]
-        for parent_idx, child_idx, local_bond in glycosidic_bonds_local:
-            parent_offset = atom_offsets[parent_idx]
-            child_offset = atom_offsets[child_idx]
-            global_atom_1 = local_bond.atom_1 + parent_offset
-            global_atom_2 = local_bond.atom_2 + child_offset
-            master_bonds.append(ParsedBond(global_atom_1, global_atom_2, single_bond_type))
+def _identify_anomeric_oxygen_target(residue: ParsedResidue) -> Optional[str]:
+    """
+    Determines if O1 or O2 should be removed based on ring topology.
+    Matches logic in preprocess_glycans.py:
+    1. If C1 is in ring -> O1
+    2. If C2 is in ring (and C1 is not) -> O2
+    """
+    ring_atom_names = _find_ring_atom_names(residue)
+    
+    if not ring_atom_names:
+        return None
 
-        final_residue = ParsedResidue("GLYCAN", const.unk_token_ids["PROTEIN"], 0, master_atoms, master_bonds, None, 0, 0, False, True)
-
-    else:
-        # --- REGULAR/BRANCHED GLYCAN PATH (Original, Unmodified Logic) ---
-        try:
-            # 1. Call the ORIGINAL, restored branching function
-            residues, connections = compute_branching_bonds(original_iupac, ccd)
-        except ValueError as e:
-            raise ValueError(f"Error parsing glycan IUPAC '{iupac}' during branching: {e}") from e
-
-        if not residues:
-            return None, None, None
-
-        # 2. Perform the original root oxygen removal
-        child_idxs = {c[1] for c in connections}
-        root_candidates = [i for i in range(len(residues)) if i not in child_idxs]
-        if len(root_candidates) == 1:
-            root_idx = root_candidates[0]
-            root_res = residues[root_idx]
-            oxy_idxs = [i for i, atom in enumerate(root_res.atoms) if atom.name.upper().startswith("O")]
-            if oxy_idxs:
-                idx_name_pairs = [(i, root_res.atoms[i].name) for i in oxy_idxs]
-                remove_idx, _ = min(idx_name_pairs, key=lambda x: x[1])
-                new_atoms, idx_map, new_bonds = [], {}, []
-                new_i = 0
-                for old_i, atom in enumerate(root_res.atoms):
-                    if old_i == remove_idx: continue
-                    new_atoms.append(atom)
-                    idx_map[old_i] = new_i
-                    new_i += 1
-                for bond in root_res.bonds:
-                    if bond.atom_1 == remove_idx or bond.atom_2 == remove_idx: continue
-                    a1, a2 = idx_map[bond.atom_1], idx_map[bond.atom_2]
-                    new_bonds.append(ParsedBond(min(a1, a2), max(a1, a2), bond.type))
-                new_center = idx_map.get(root_res.atom_center, 0)
-                new_disto = idx_map.get(root_res.atom_disto, 0)
-                residues[root_idx] = replace(root_res, atoms=new_atoms, bonds=new_bonds, atom_center=new_center, atom_disto=new_disto)
+    if 'C1' in ring_atom_names:
+        return 'O1'
+    elif 'C2' in ring_atom_names:
+        # Implicitly, if C1 was there, we matched above. 
+        # So this handles the "C2 in ring AND C1 not in ring" case.
+        return 'O2'
         
-        # 3. Perform the original stitching process
-        glycosidic_bonds_local = []
-        for parent_idx, child_idx, bond_spec in connections:
-            parent_res, child_res = residues[parent_idx], residues[child_idx]
-            try:
-                transformed_child, glyco_bond_local = stitch_monosaccharides(parent_res, child_res, bond_spec)
-                residues[child_idx] = transformed_child
-                glycosidic_bonds_local.append((parent_idx, child_idx, glyco_bond_local))
-            except ValueError as e:
-                raise ValueError(f"Error stitching {parent_res.name}({parent_idx}) to {child_res.name}({child_idx}): {e}") from e
+    return None
 
-        # 4. Aggregate and Relax the structure
-        master_atoms, master_bonds, atom_to_mono_idx_list, atom_offsets = [], [], [], {}
-        current_offset = 0
-        for mono_idx, res in enumerate(residues):
-            num_atoms_in_mono = len(res.atoms)
-            atom_offsets[mono_idx] = current_offset
-            master_atoms.extend(res.atoms)
-            atom_to_mono_idx_list.extend([mono_idx] * num_atoms_in_mono)
-            for bond in res.bonds:
-                master_bonds.append(ParsedBond(bond.atom_1 + current_offset, bond.atom_2 + current_offset, bond.type))
-            current_offset += num_atoms_in_mono
+def parse_glycan(
+    iupac: str,
+    ccd: Mapping[str, Mol]
+) -> Tuple[List[ParsedResidue], List[Tuple[int, int, int, int]], Dict[int, dict], np.ndarray]:
+    """
+    (OVERHAULED) Parses a glycan IUPAC string into a topology of residues.
+    Handles both linear/branched glycans and cyclodextrins.
+    
+    Features:
+    - Stoichiometry: 
+        - Non-Root Residues: Anomeric oxygen (O1/O2) is REMOVED.
+        - Root Residue: 
+            - If config provided (e.g., "GAL(a)"), O1/O2 is KEPT.
+            - If no config (e.g., "GAL"), O1/O2 is REMOVED.
+    - Connections: Returns atom-level indices based on the filtered atom lists.
+    - Correct Indexing: Ensures res.idx matches the topological list index.
+    """
+    
+    root_config_spec = None
+    
+    # 1. Determine Topology (Residues + Abstract Connections)
+    try:
+        if '{' in iupac:
+             # Cyclodextrins don't strictly have a "root" in the linear sense, usually treated as all connected.
+             # Standard logic applies.
+             residues, raw_connections = compute_cyclodextrin_bonds(iupac, ccd)
+        else:
+             residues, raw_connections, root_config_spec = compute_branching_bonds(iupac, ccd)
+    except ValueError as e:
+        raise ValueError(f"Error parsing glycan IUPAC '{iupac}': {e}") from e
 
-        single_bond_type = const.bond_type_ids["SINGLE"]
-        for parent_idx, child_idx, local_bond in glycosidic_bonds_local:
-            parent_offset, child_offset = atom_offsets[parent_idx], atom_offsets[child_idx]
-            global_atom_1, global_atom_2 = local_bond.atom_1 + parent_offset, local_bond.atom_2 + child_offset
-            master_bonds.append(ParsedBond(global_atom_1, global_atom_2, single_bond_type))
+    if not residues:
+        return [], [], {}, np.array([])
 
-        temp_residue = ParsedResidue("GLYCAN", const.unk_token_ids["PROTEIN"], 0, master_atoms, master_bonds, None, 0, 0, False, True)
-        temp_chain = ParsedChain("temp_glycan_chain", const.chain_type_ids["NONPOLYMER"], [temp_residue], 0)
+    # --- RE-INDEXING STEP (CRITICAL FIX) ---
+    # The residues are topologically ordered (Root=0), but their internal .idx
+    # property reflects the parsing order. We must re-index them to match the list order
+    # so that schema lookups (which use .idx) align with the topological logic.
+    residues_reindexed = []
+    for new_idx, res in enumerate(residues):
+        residues_reindexed.append(replace(res, idx=new_idx))
+    
+    # Use the re-indexed list for all subsequent operations
+    residues_modified = list(residues_reindexed) 
+    
+    # The Root is always index 0 after reordering in compute_branching_bonds
+    root_idx = 0 
+    
+    # --- STOICHIOMETRY ADJUSTMENT STEP ---
+    for i in range(len(residues_modified)):
+        # Determine if we should keep the oxygen
+        # Only keep if it is the Root AND the Root has an explicit anomeric config
+        keep_anomeric_oxygen = (i == root_idx) and (root_config_spec is not None)
+
+        if keep_anomeric_oxygen:
+            # Do not delete the oxygen for this residue
+            continue
+
+        target_o = _identify_anomeric_oxygen_target(residues_modified[i])
+        
+        if target_o:
+            # Physically remove the atom and re-index the residue
+            residues_modified[i] = _remove_atom(residues_modified[i], target_o)
+
+    # 2. Resolve Atomic Connections (Using Post-Deletion Indices)
+    connection_indices = []
+    
+    for parent_idx, child_idx, bond_spec in raw_connections:
+        parent_res = residues_modified[parent_idx]
+        child_res = residues_modified[child_idx]
+        _, donor_num, acceptor_num = bond_spec
+        
+        # Define connecting atoms (Parent Oxygen -> Child Carbon)
+        acceptor_o_name = f"O{acceptor_num}"
+        donor_c_name = f"C{donor_num}"
+        
         try:
-            relaxed_chains = relax_glycan_structure({"temp_glycan_chain": temp_chain}, [])
-            final_residue = relaxed_chains["temp_glycan_chain"].residues[0]
-        except Exception:
-            print(f"[parse_glycan] Warning: Structure relaxation failed for IUPAC '{iupac}'. Using unrelaxed coordinates.")
-            final_residue = temp_residue
+            # Find indices in the modified atom lists
+            p_atom_idx = next(i for i, a in enumerate(parent_res.atoms) if a.name.upper() == acceptor_o_name.upper())
+            c_atom_idx = next(i for i, a in enumerate(child_res.atoms) if a.name.upper() == donor_c_name.upper())
+            
+            connection_indices.append((parent_idx, child_idx, p_atom_idx, c_atom_idx))
+                    
+        except StopIteration:
+            p_atoms = [a.name for a in parent_res.atoms]
+            c_atoms = [a.name for a in child_res.atoms]
+            raise ValueError(
+                f"Topology Error: Could not link {parent_res.name} (idx {parent_idx}) to {child_res.name} (idx {child_idx}).\n"
+                f"  Expected Parent Atom: {acceptor_o_name} (Available: {p_atoms})\n"
+                f"  Expected Child Atom: {donor_c_name} (Available: {c_atoms})"
+            )
 
-    # --- COMMON LOGIC FOR BOTH PATHS ---
+    # 3. Build Feature Maps
     prelim_features: Dict[int, dict] = {}
-    connections_by_child = {c[1]: c for c in connections}
-    for i, res_initial in enumerate(residues):
-        ccd_code = res_initial.name
-        conn_info = connections_by_child.get(i)
-        anomeric_config = conn_info[2][0] if conn_info else None
-        prelim_features[i] = {"ccd_code": ccd_code, "anomeric_config": anomeric_config}
+    
+    # Map child_idx -> bond_spec to extract anomeric config for features
+    connections_by_child = {c: spec for _, c, spec in raw_connections}
+    
+    for i, res in enumerate(residues_modified):
+        anomeric = None
+        
+        if i == root_idx and root_config_spec is not None:
+            # Root specific config
+            anomeric = root_config_spec[0]
+        else:
+            # Internal linkage config
+            bond_spec = connections_by_child.get(i)
+            anomeric = bond_spec[0] if bond_spec else None
+            
+        prelim_features[i] = {"ccd_code": res.name, "anomeric_config": anomeric}
 
-    # --- MODIFICATION START ---
-    # Zero out the conformer space for all atoms in the final glycan residue.
-    # This ensures that for glycan chains, the idealized coordinates are all (0,0,0).
-    if final_residue:
-        zeroed_atoms = [
-            replace(atom, conformer=(0.0, 0.0, 0.0)) for atom in final_residue.atoms
-        ]
-        final_residue = replace(final_residue, atoms=zeroed_atoms)
-    # --- MODIFICATION END ---
-
+    # 4. Build Atom-to-Mono Index Map
+    atom_to_mono_idx_list = []
+    for i, res in enumerate(residues_modified):
+        atom_to_mono_idx_list.extend([i] * len(res.atoms))
     atom_to_mono_idx_array = np.array(atom_to_mono_idx_list, dtype=np.int32)
 
-    return final_residue, prelim_features, atom_to_mono_idx_array
+    return residues_modified, connection_indices, prelim_features, atom_to_mono_idx_array
