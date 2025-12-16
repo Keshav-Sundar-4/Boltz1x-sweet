@@ -21,6 +21,7 @@ from boltz.data.feature.symmetry import (
 )
 from boltz.model.modules.sugar_trunk import (
     SugarPairformer, 
+    AnomericBondBias
 )
 from boltz.model.loss.confidence import confidence_loss
 from boltz.model.loss.distogram import distogram_loss
@@ -169,6 +170,9 @@ class Boltz1(LightningModule):
                 token_z=token_z,
                 **glycan_bias_args.get("params", {}),
             )
+            
+        # Initialize the new Anomeric Bias module (token.anomeric bias)
+        self.token_anomeric_bias = AnomericBondBias(token_z)
 
         full_embedder_args = {
             "atom_s": atom_s,
@@ -321,7 +325,12 @@ class Boltz1(LightningModule):
             )
             relative_position_encoding = self.rel_pos(feats)
             z_init = z_init + relative_position_encoding
+            
+            # Apply token bonds bias
             z_init = z_init + self.token_bonds(feats["token_bonds"].float())
+            
+            # Apply the new token.anomeric bias here
+            z_init = self.token_anomeric_bias(z_init, feats)
 
             # Perform rounds of the pairwise stack
             s = torch.zeros_like(s_init)
@@ -349,7 +358,6 @@ class Boltz1(LightningModule):
                         z = z + self.msa_module(z, s_inputs, feats)
 
                     # The SugarPairformer refines the CURRENT state of s and z in the loop.
-                    # This runs only if the module was enabled and instantiated in __init__.
                     if self.sugar_pairformer is not None:
                         s, z = self.sugar_pairformer(s, z, feats)
 
@@ -1356,81 +1364,6 @@ class Boltz1(LightningModule):
 
     def on_test_start(self) -> None:
         self.prepare_eval()
-
-
-def _print_distogram_debug(feats: Dict[str, Any], pdistogram_logits: torch.Tensor, glyco_feats: Dict[str, Any], output_path: str = "distogram_debug_output.tsv"):
-    """
-    Prints the distogram with detailed token type annotations for debugging.
-    This is a self-contained, patchwork function as requested for debugging glycan modules.
-    """
-    # This function should only run once, not on all devices in DDP, to prevent file conflicts
-    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
-        return
-        
-    pdistogram_logits = pdistogram_logits.detach().cpu()
-    distogram_bins = torch.argmax(pdistogram_logits, dim=-1)
-    
-    # We only process the first item in the batch for simplicity and to create a manageable file
-    b = 0
-    
-    # Determine the number of actual (unpadded) tokens for this batch item
-    pad_mask = feats['token_pad_mask'][b].cpu()
-    num_tokens = int(pad_mask.sum().item())
-    if num_tokens == 0:
-        return
-
-    # 1. Get glycosylation site tokens for the first batch item
-    # The .get() with a default tensor handles cases where there are no glycosylation sites
-    t_batch_idx = glyco_feats.get('t_batch_idx', torch.tensor([], device='cpu')).cpu()
-    t_glycosylation_indices = glyco_feats.get('t_glycosylation_indices', torch.empty(0, 2, device='cpu')).cpu()
-
-    batch_mask = t_batch_idx == b
-    site_tokens_b = t_glycosylation_indices[batch_mask]
-    
-    glycosylated_protein_tokens = set()
-    glycosylated_glycan_tokens = set()
-    if site_tokens_b.numel() > 0:
-        glycosylated_protein_tokens = set(site_tokens_b[:, 0].tolist())
-        glycosylated_glycan_tokens = set(site_tokens_b[:, 1].tolist())
-
-    # 2. Classify each token
-    token_types = [""] * num_tokens
-    is_mono_b = feats['is_monosaccharide'][b, :num_tokens, 0].cpu() > 0
-    mol_type_b = feats['mol_type'][b, :num_tokens].cpu()
-    is_protein_b = mol_type_b == const.chain_type_ids["PROTEIN"]
-
-    for i in range(num_tokens):
-        is_glyco_prot = i in glycosylated_protein_tokens
-        is_glyco_glycan = i in glycosylated_glycan_tokens
-
-        if is_glyco_prot:
-            token_types[i] = "glycosylated protein token"
-        elif is_glyco_glycan:
-            token_types[i] = "glycosylated glycan token"
-        elif is_mono_b[i]:
-            token_types[i] = "glycan atom"
-        elif is_protein_b[i]:
-            token_types[i] = "normal protein token"
-        else:
-            token_types[i] = "other"
-
-    # 3. Write the token-pair data to a file
-    try:
-        with open(output_path, "w") as f:
-            f.write("token_i\ttype_i\ttoken_j\ttype_j\tdistogram_bin\n")
-            
-            for i in range(num_tokens):
-                for j in range(num_tokens):
-                    type_i = token_types[i]
-                    type_j = token_types[j]
-                    
-                    bin_val = distogram_bins[b, i, j].item()
-                    
-                    f.write(f"{i}\t{type_i}\t{j}\t{type_j}\t{bin_val}\n")
-        
-        print(f"DEBUG: Wrote distogram for the first batch item to {output_path}")
-    except Exception as e:
-        print(f"DEBUG: Failed to write distogram file. Error: {e}")
 
 def detach_feats(feats: dict) -> dict:
     """
