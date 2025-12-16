@@ -1,8 +1,6 @@
 # started from code from https://github.com/lucidrains/alphafold3-pytorch, MIT License, Copyright (c) 2024 Phil Wang
 from functools import partial
 from math import pi
-import sys
-from boltz.data.feature.featurizer import MONO_TYPE_MAP
 
 from einops import rearrange
 import torch
@@ -15,7 +13,7 @@ import boltz.model.layers.initialize as init
 from boltz.model.layers.transition import Transition
 from boltz.model.modules.transformers import AtomTransformer
 from boltz.model.modules.utils import LinearNoBias
-from boltz.model.modules.sugar_trunk import GlycanAtomTopologicalEncoder
+import sys
 
 
 class FourierEmbedding(Module):
@@ -45,29 +43,18 @@ class FourierEmbedding(Module):
         rand_proj = self.proj(times)
         return torch.cos(2 * pi * rand_proj)
 
-
 class RelativePositionEncoder(Module):
     """Relative position encoder."""
 
     def __init__(self, token_z, r_max=32, s_max=2):
-        """Initialize the relative position encoder.
-
-        Parameters
-        ----------
-        token_z : int
-            The pair representation dimension.
-        r_max : int, optional
-            The maximum index distance, by default 32.
-        s_max : int, optional
-            The maximum chain distance, by default 2.
-
-        """
+        """Initialize the relative position encoder."""
         super().__init__()
         self.r_max = r_max
         self.s_max = s_max
         self.linear_layer = LinearNoBias(4 * (r_max + 1) + 2 * (s_max + 1) + 1, token_z)
 
     def forward(self, feats):
+        # --- Standard RelPos Logic ---
         b_same_chain = torch.eq(
             feats["asym_id"][:, :, None], feats["asym_id"][:, None, :]
         )
@@ -80,6 +67,7 @@ class RelativePositionEncoder(Module):
         rel_pos = (
             feats["residue_index"][:, :, None] - feats["residue_index"][:, None, :]
         )
+        
         if torch.any(feats["cyclic_period"] != 0):
             period = torch.where(
                 feats["cyclic_period"] > 0,
@@ -88,12 +76,9 @@ class RelativePositionEncoder(Module):
             )
             rel_pos = (rel_pos - period * torch.round(rel_pos / period)).long()
 
-        d_residue = torch.clip(
-            rel_pos + self.r_max,
-            0,
-            2 * self.r_max,
-        )
+        d_residue = torch.clip(rel_pos + self.r_max, 0, 2 * self.r_max)
 
+        # Standard masking: If different chains, set to "Far" bin
         d_residue = torch.where(
             b_same_chain, d_residue, torch.zeros_like(d_residue) + 2 * self.r_max + 1
         )
@@ -123,6 +108,7 @@ class RelativePositionEncoder(Module):
         )
         a_rel_chain = one_hot(d_chain, 2 * self.s_max + 2)
 
+        # Calculate the full bias matrix `p` normally first
         p = self.linear_layer(
             torch.cat(
                 [
@@ -134,90 +120,26 @@ class RelativePositionEncoder(Module):
                 dim=-1,
             )
         )
+
+        # --- GLYCAN SPECIFIC MASKING ---
+        # 1. Identify Glycan Tokens
+        is_mono_feat = feats.get("is_monosaccharide", torch.zeros_like(feats["asym_id"]).unsqueeze(-1))
+        is_glycan = is_mono_feat.squeeze(-1) > 0.5 
+
+        # 2. Identify pairs where BOTH are Glycans
+        pair_is_both_glycan = is_glycan[:, :, None] & is_glycan[:, None, :]
+
+        # 3. Identify Inter-Residue pairs (Different Monosaccharides)
+        pair_is_inter_residue = ~b_same_residue
+
+        # 4. The Mask: True if we should suppress the bias
+        # Logic: Both Glycans AND Same Chain AND Different Residues
+        suppress_mask = pair_is_both_glycan & b_same_chain & pair_is_inter_residue
+
+        # 5. Apply Mask: Zero out the bias `p` for intra-glycan topology
+        p = torch.where(suppress_mask.unsqueeze(-1), torch.zeros_like(p), p)
+
         return p
-
-####################################################################################################
-# NEW CHIRAL ENCODER
-####################################################################################################
-
-def _decode_atom_name_from_onehot(one_hot_encoded_name: torch.Tensor) -> str:
-    """
-    Decodes a one-hot encoded atom name tensor [4, 64] back into a string.
-    The encoding assumes a vocabulary of printable ASCII characters offset by 32.
-    """
-    # Find the integer index for each of the 4 character positions
-    integer_indices = torch.argmax(one_hot_encoded_name, dim=-1)
-    # Add 32 to convert back to ASCII character codes
-    char_codes = [idx.item() + 32 for idx in integer_indices]
-    # Filter out null characters (code 32) and join
-    return "".join([chr(c) for c in char_codes if c > 32]).strip()
-
-
-class ChiralEncoder(nn.Module):
-    """
-    Modulates atom single representations based on R/S chirality via a context-dependent update.
-    This implementation uses indexed operations to ensure that ONLY chiral atoms are modified,
-    leaving non-chiral atom representations completely untouched.
-    It includes a dummy loss term to ensure compatibility with Distributed Data Parallel (DDP)
-    training, preventing crashes when a batch contains no chiral atoms.
-    Chirality values are mapped: 1 (R) -> index 0, 2 (S) -> index 1.
-    """
-
-    def __init__(self, atom_s: int, chiral_embed_dim: int = 16):
-        super().__init__()
-        self.atom_s = atom_s
-        self.chiral_embed_dim = chiral_embed_dim
-        # Embedding for R and S ONLY. Size is 2.
-        self.chiral_embedding = nn.Embedding(2, self.chiral_embed_dim)
-        self.projection = nn.Linear(self.atom_s + self.chiral_embed_dim, self.atom_s)
-        init.final_init_(self.projection.weight)
-
-    def forward(self, c: torch.Tensor, feats: dict) -> torch.Tensor:
-        """
-        Applies a chirality-based update to the features of stereocenters.
-
-        Args:
-            c (torch.Tensor): The input atom single representations [B, N, atom_s].
-            feats (dict): The input features dictionary.
-
-        Returns:
-            torch.Tensor: The updated atom representations.
-        """
-        # If no chirality information is provided, return the input tensor unmodified.
-        if "atom_chirality" not in feats:
-            return c
-
-        atom_chirality = feats["atom_chirality"]  # Shape: [B, N]
-
-        # 1. Identify the indices of all atoms that are actual stereocenters (R or S).
-        chiral_indices = torch.where(atom_chirality > 0)
-
-        # Create a clone of the input tensor to store the final result.
-        # We will modify this tensor in-place for chiral atoms.
-        c_final = c.clone()
-
-        # If there are chiral atoms in the batch, perform the update.
-        if chiral_indices[0].numel() > 0:
-            # 2. Gather the data for ONLY the chiral atoms using the identified indices.
-            c_chiral = c[chiral_indices]                  # Features of chiral atoms
-            chirality_values = atom_chirality[chiral_indices]  # Chirality labels (1 for R, 2 for S)
-
-            # 3. Perform the context-dependent update calculation on this small subset.
-            # Map R/S values (1/2) to embedding indices (0/1).
-            embedding_indices = chirality_values - 1
-            chiral_emb = self.chiral_embedding(embedding_indices)
-
-            c_chiral_with_emb = torch.cat([c_chiral, chiral_emb], dim=-1)
-            update = self.projection(c_chiral_with_emb)
-
-            # 4. Apply the update back to the cloned tensor at the correct locations.
-            c_final[chiral_indices] = c_chiral + update # Apply the residual update
-
-        # --- DDP Compatibility: Dummy Loss ---
-        dummy_loss = (self.chiral_embedding.weight.sum() + self.projection.weight.sum() + self.projection.bias.sum()) * 0.0
-        
-        return c_final + dummy_loss
-
 
 class SingleConditioning(Module):
     """Single conditioning layer."""
@@ -370,7 +292,7 @@ def single_to_keys(single, indexing_matrix, W, H):
         B, K, H, D
     )
 
-class AtomAttentionEncoder(Module):
+class AtomAttentionEncoder(nn.Module):
     """Atom attention encoder."""
 
     def __init__(
@@ -390,16 +312,12 @@ class AtomAttentionEncoder(Module):
         """Initialize the atom attention encoder."""
         super().__init__()
 
-        self.embed_atom_features = LinearNoBias(atom_feature_dim, atom_s)
+        self.embed_atom_features = LinearNoBias(atom_feature_dim, atom_s)        
         self.embed_atompair_ref_pos = LinearNoBias(3, atom_z)
         self.embed_atompair_ref_dist = LinearNoBias(1, atom_z)
         self.embed_atompair_mask = LinearNoBias(1, atom_z)
         self.atoms_per_window_queries = atoms_per_window_queries
         self.atoms_per_window_keys = atoms_per_window_keys
-        self.chiral_encoder = ChiralEncoder(atom_s=atom_s)
-        self.glycan_topo_encoder = GlycanAtomTopologicalEncoder()
-
-        self.embed_glycan_topo_dist = LinearNoBias(1, atom_z)
 
         self.structure_prediction = structure_prediction
         if structure_prediction:
@@ -474,6 +392,8 @@ class AtomAttentionEncoder(Module):
             layer_cache = model_cache[cache_prefix]
 
         if model_cache is None or len(layer_cache) == 0:
+            # either model is not using the cache or it is the first time running it
+
             atom_ref_pos = feats["ref_pos"]
             atom_uid = feats["ref_space_uid"]
             atom_feats = torch.cat(
@@ -488,9 +408,10 @@ class AtomAttentionEncoder(Module):
             )
 
             c = self.embed_atom_features(atom_feats)
-            c = self.chiral_encoder(c, feats)
 
+            # NOTE: we are already creating the windows to make it more efficient
             W, H = self.atoms_per_window_queries, self.atoms_per_window_keys
+            B, N = c.shape[:2]
             K = N // W
             keys_indexing_matrix = get_indexing_matrix(K, W, H, c.device)
             to_keys = partial(
@@ -499,6 +420,10 @@ class AtomAttentionEncoder(Module):
 
             atom_ref_pos_queries = atom_ref_pos.view(B, K, W, 1, 3)
             atom_ref_pos_keys = to_keys(atom_ref_pos).view(B, K, 1, H, 3)
+
+            d = atom_ref_pos_keys - atom_ref_pos_queries
+            d_norm = torch.sum(d * d, dim=-1, keepdim=True)
+            d_norm = 1 / (1 + d_norm)
 
             atom_mask_queries = atom_mask.view(B, K, W, 1)
             atom_mask_keys = (
@@ -518,46 +443,20 @@ class AtomAttentionEncoder(Module):
                 .unsqueeze(-1)
             )
 
-            d = atom_ref_pos_queries - atom_ref_pos_keys
-            d_norm = torch.linalg.norm(d, dim=-1, keepdim=True).clamp(min=1e-5)
-            p_geo_pos = self.embed_atompair_ref_pos(d)
-            p_geo_dist = self.embed_atompair_ref_dist(d_norm)
-
-            topo_dist_full = self.glycan_topo_encoder(feats)
-            p_glycan_full = self.embed_glycan_topo_dist((topo_dist_full.float() + 1).unsqueeze(-1))
-
-            q_indices = torch.arange(N, device=c.device).view(1, K, W, 1)
-            rel_k_indices = (torch.arange(H, device=c.device) - H // 2).view(1, 1, 1, H)
-            k_indices = (q_indices + rel_k_indices).clamp(0, N - 1)
-            b_idx = torch.arange(B, device=c.device).view(B, 1, 1, 1)
-            p_glycan_windowed = p_glycan_full[b_idx, q_indices, k_indices]
-
-            is_glycan_atom = (feats['atom_mono_idx'] != -1)
-            atom_to_token_map = feats['atom_to_token'].argmax(-1)
-            token_asym_id = feats['asym_id']
-            atom_asym_id = torch.gather(token_asym_id, 1, atom_to_token_map)
-
-            is_glycan_queries = is_glycan_atom.view(B, K, W, 1)
-            is_glycan_keys = to_keys(is_glycan_atom.unsqueeze(-1).float()).view(B, K, 1, H).bool()
-            atom_asym_id_queries = atom_asym_id.view(B, K, W, 1)
-            atom_asym_id_keys = to_keys(atom_asym_id.unsqueeze(-1).float()).view(B, K, 1, H).long()
-            is_intra_glycan_pair = (
-                is_glycan_queries &
-                is_glycan_keys &
-                (atom_asym_id_queries == atom_asym_id_keys)
-            ).unsqueeze(-1)
-
-            is_not_intra_glycan = ~is_intra_glycan_pair
-            p = (p_geo_pos + p_geo_dist) * v * is_not_intra_glycan
-            p = p + p_glycan_windowed * is_intra_glycan_pair
+            p = self.embed_atompair_ref_pos(d) * v
+            p = p + self.embed_atompair_ref_dist(d_norm) * v
             p = p + self.embed_atompair_mask(v) * v
+
             q = c
 
             if self.structure_prediction:
+                # run only in structure model not in initial encoding
                 atom_to_token = feats["atom_to_token"].float()
+
                 s_to_c = self.s_to_c_trans(s_trunk)
                 s_to_c = torch.bmm(atom_to_token, s_to_c)
                 c = c + s_to_c
+
                 atom_to_token_queries = atom_to_token.view(
                     B, K, W, atom_to_token.shape[-1]
                 )
@@ -580,6 +479,7 @@ class AtomAttentionEncoder(Module):
                 layer_cache["c"] = c
                 layer_cache["p"] = p
                 layer_cache["to_keys"] = to_keys
+
         else:
             q = layer_cache["q"]
             c = layer_cache["c"]
@@ -587,6 +487,7 @@ class AtomAttentionEncoder(Module):
             to_keys = layer_cache["to_keys"]
 
         if self.structure_prediction:
+            # only here the multiplicity kicks in because we use the different positions r
             q = q.repeat_interleave(multiplicity, 0)
             r_input = torch.cat(
                 [r, torch.zeros((B * multiplicity, N, 7)).to(r)],
