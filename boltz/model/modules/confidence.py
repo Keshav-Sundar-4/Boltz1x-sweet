@@ -16,6 +16,7 @@ from boltz.model.modules.trunk import (
 )
 from boltz.model.modules.sugar_trunk import (
     SugarPairformer, 
+    AnomericBondBias
 )
 from boltz.model.modules.utils import LinearNoBias
 
@@ -42,44 +43,7 @@ class ConfidenceModule(nn.Module):
         msa_args: dict = None,
         compile_pairformer=False,
     ):
-        """Initialize the confidence module.
-
-        Parameters
-        ----------
-        token_s : int
-            The single representation dimension.
-        token_z : int
-            The pair representation dimension.
-        pairformer_args : int
-            The pairformer arguments.
-        glycan_bias_args: dict, optional
-            The glycan bias arguments, by default None.
-        num_dist_bins : int, optional
-            The number of distance bins, by default 64.
-        max_dist : int, optional
-            The maximum distance, by default 22.
-        add_s_to_z_prod : bool, optional
-            Whether to add s to z product, by default False.
-        add_s_input_to_s : bool, optional
-            Whether to add s input to s, by default False.
-        use_s_diffusion : bool, optional
-            Whether to use s diffusion, by default False.
-        add_z_input_to_z : bool, optional
-            Whether to add z input to z, by default False.
-        confidence_args : dict, optional
-            The confidence arguments, by default None.
-        compute_pae : bool, optional
-            Whether to compute pae, by default False.
-        imitate_trunk : bool, optional
-            Whether to imitate trunk, by default False.
-        full_embedder_args : dict, optional
-            The full embedder arguments, by default None.
-        msa_args : dict, optional
-            The msa arguments, by default None.
-        compile_pairformer : bool, optional
-            Whether to compile pairformer, by default False.
-
-        """
+        """Initialize the confidence module."""
         super().__init__()
         self.max_num_atoms_per_token = 23
         self.no_update_s = pairformer_args.get("no_update_s", False)
@@ -109,16 +73,15 @@ class ConfidenceModule(nn.Module):
             self.s_to_z_prod_out = LinearNoBias(token_z, token_z)
             init.gating_init_(self.s_to_z_prod_out.weight)
 
+        # Initialize to None for safety across paths
         self.sugar_pairformer = None
-        if glycan_bias_args and glycan_bias_args.get("enabled", False):
-            self.sugar_pairformer = SugarPairformer(
-                token_s=token_s,
-                token_z=token_z,
-                **glycan_bias_args.get("params", {}),
-            )
-
+        self.token_anomeric_bias = None
         self.imitate_trunk = imitate_trunk
+
         if self.imitate_trunk:
+            # =========================================================
+            # PATH 1: IMITATE TRUNK (Full Reconstruction)
+            # =========================================================
             s_input_dim = (
                 token_s + 2 * const.num_tokens + 1 + len(const.pocket_contact_info)
             )
@@ -129,6 +92,16 @@ class ConfidenceModule(nn.Module):
             self.input_embedder = InputEmbedder(**full_embedder_args)
             self.rel_pos = RelativePositionEncoder(token_z)
             self.token_bonds = nn.Linear(1, token_z, bias=False)
+            
+            # --- GLYCAN BIAS (Full Stack) ---
+            # In imitate trunk, we use both the bond bias and the Pairformer
+            if glycan_bias_args and glycan_bias_args.get("enabled", False):
+                self.token_anomeric_bias = AnomericBondBias(token_z)
+                self.sugar_pairformer = SugarPairformer(
+                    token_s=token_s,
+                    token_z=token_z,
+                    **glycan_bias_args.get("params", {}),
+                )
 
             self.s_norm = nn.LayerNorm(token_s)
             self.z_norm = nn.LayerNorm(token_z)
@@ -160,7 +133,11 @@ class ConfidenceModule(nn.Module):
 
             self.final_s_norm = nn.LayerNorm(token_s)
             self.final_z_norm = nn.LayerNorm(token_z)
+
         else:
+            # =========================================================
+            # PATH 2: LIGHTWEIGHT (No Reconstruction)
+            # =========================================================
             self.s_inputs_norm = nn.LayerNorm(s_input_dim)
             if not self.no_update_s:
                 self.s_norm = nn.LayerNorm(token_s)
@@ -175,6 +152,11 @@ class ConfidenceModule(nn.Module):
             if add_z_input_to_z:
                 self.rel_pos = RelativePositionEncoder(token_z)
                 self.token_bonds = nn.Linear(1, token_z, bias=False)
+                
+                # --- GLYCAN BIAS (Bond Bias Only) ---
+                # As requested, if not mimicking trunk, we only add the bias
+                if glycan_bias_args and glycan_bias_args.get("enabled", False):
+                    self.token_anomeric_bias = AnomericBondBias(token_z)
 
             self.pairformer_stack = PairformerModule(
                 token_s,
@@ -239,7 +221,7 @@ class ConfidenceModule(nn.Module):
             return out_dict
 
         if self.imitate_trunk:
-            # Re-initialize s and z from scratch, mimicking the main trunk's initialization.
+            # === Full Reconstruction Path ===
             s_inputs = self.input_embedder(feats)
 
             s_init = self.s_init(s_inputs)
@@ -251,12 +233,15 @@ class ConfidenceModule(nn.Module):
             z_init = z_init + relative_position_encoding
             z_init = z_init + self.token_bonds(feats["token_bonds"].float())
             
-            # Use the detached s and z from the main model ONLY for the recycling addition.
+            # Apply anomeric bias if it exists (Imitate Trunk)
+            if self.token_anomeric_bias is not None:
+                z_init = self.token_anomeric_bias(z_init, feats)
+                
             s = s_init + self.s_recycle(self.s_norm(s))
             z = z_init + self.z_recycle(self.z_norm(z))
 
         else:
-            # Lightweight path: use the provided (detached) s and z directly.
+            # === Lightweight Path ===
             s_inputs = self.s_inputs_norm(s_inputs).repeat_interleave(multiplicity, 0)
             if not self.no_update_s:
                 s = self.s_norm(s)
@@ -270,8 +255,12 @@ class ConfidenceModule(nn.Module):
                 relative_position_encoding = self.rel_pos(feats)
                 z = z + relative_position_encoding
                 z = z + self.token_bonds(feats["token_bonds"].float())
-                        
-        # --- The following operations apply to BOTH imitate_trunk and the lightweight path ---
+                
+                # Apply anomeric bias if it exists (Lightweight)
+                if self.token_anomeric_bias is not None:
+                    z = self.token_anomeric_bias(z, feats)
+
+        # --- Shared Logic ---
         s = s.repeat_interleave(multiplicity, 0)
 
         if self.use_s_diffusion:
@@ -319,10 +308,7 @@ class ConfidenceModule(nn.Module):
             s, z = self.final_s_norm(s), self.final_z_norm(z)
 
         else:
-            # Lightweight path
-            if self.sugar_pairformer is not None:
-                s, z = self.sugar_pairformer(s, z, feats)
-            
+            # Note: No SugarPairformer here as requested for the lightweight path
             s_t, z_t = self.pairformer_stack(s, z, mask=mask, pair_mask=pair_mask)
 
             s = s_t
