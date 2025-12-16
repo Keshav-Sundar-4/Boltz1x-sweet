@@ -37,7 +37,6 @@ from boltz.data.types import (
 # Import necessary helper functions (adapt paths if needed)
 from boltz.data.parse.schema import (
     get_conformer, convert_atom_name, parse_ccd_residue,
-    stitch_monosaccharides, relax_glycan_structure
 )
 # Need ParsedAtom, ParsedBond, ParsedResidue, ParsedChain for intermediate representation
 #from boltz.data.parse.mmcif import ParsedAtom, ParsedBond, ParsedResidue, ParsedChain
@@ -107,6 +106,7 @@ class GlycosylationSiteConnection:
     glycan_chain_id: str
     glycan_res_id: int
     glycan_atom_name: str
+    anomeric: Optional[str] = None
 
 # Now, define the main data container, which can safely reference the classes above.
 @dataclass
@@ -174,68 +174,6 @@ class AnomericTestAtom:
 class AnomericTestGlycoConnection:
     parent_res_key: Tuple[str, int]; child_res_key: Tuple[str, int]; parent_acceptor_atom: AnomericTestAtom
     child_donor_atom: AnomericTestAtom; anomeric_config: Optional[str]
-
-# --- Utility Functions ---
-def get_glycan_sequence_key(
-    pdb_file: PDBFile,
-) -> Tuple[str, Optional[str]]:
-    """
-    (REVISED & FIXED) Generates a sequence key for clustering based on the
-    pre-separated chains in the input file.
-
-    This strategy now implements two paths:
-    1. If a file contains ANY protein chains, it is assigned a unique
-       cluster key to ensure it is processed uniquely as a glycoprotein complex.
-    2. If a file contains ONLY glycan chains, it is clustered using the
-       4-bin glycan size strategy based on the total number of monosaccharides.
-    """
-    try:
-        # --- FIX START ---
-        # The file must be opened and its lines read before being passed to the parser.
-        with open(pdb_file.path, 'r', encoding='latin-1') as f:
-            pdb_lines = f.readlines()
-        
-        # Now, pass the list of lines, not the path object.
-        atoms_by_residue, chain_types = parse_pdb_atoms_by_residue(pdb_lines)
-        # --- FIX END ---
-
-        if not atoms_by_residue:
-            return pdb_file.id, None
-
-        has_protein_component = any(typ == "PROTEIN" for typ in chain_types.values())
-
-        if has_protein_component:
-            # Path 1: It's a glycoprotein complex. Assign a unique cluster key.
-            sequence_key = f"PROTEIN_COMPLEX_{pdb_file.id}"
-            return pdb_file.id, sequence_key
-        else:
-            # Path 2: It's a glycan-only file. Cluster by size.
-            glycan_residue_count = sum(
-                1 for atoms in atoms_by_residue.values()
-                if atoms and atoms[0]['residue_name'] in MONO_TYPE_MAP and MONO_TYPE_MAP[atoms[0]['residue_name']] != "OTHER"
-            )
-
-            if glycan_residue_count > 0:
-                if glycan_residue_count == 1:
-                    sequence_key = "GLYCAN_1-mer"
-                elif glycan_residue_count == 2:
-                    sequence_key = "GLYCAN_2-mer"
-                elif 3 <= glycan_residue_count <= 6:
-                    sequence_key = "GLYCAN_3-6-mer"
-                else:  # glycan_residue_count >= 7
-                    sequence_key = "GLYCAN_7+-mer"
-                return pdb_file.id, sequence_key
-            else:
-                return pdb_file.id, None
-
-    except Exception:
-        tb_str = traceback.format_exc()
-        print(
-            f"--- TOP-LEVEL EXCEPTION in get_glycan_sequence_key for {pdb_file.id} ---\n{tb_str}\n--------------------",
-            file=sys.stderr,
-            flush=True
-        )
-        return pdb_file.id, None
 
 def _generate_chain_ids(exclude=None):
     """
@@ -424,11 +362,16 @@ def detect_all_connections(
     pdb_id: str = "UNKNOWN"
 ) -> Tuple[List[GlycoConnection], List[GlycosylationSiteConnection], Dict[str, Dict[str, int]], List[Tuple[str, str, int, str]], List[Tuple[str, str, int]]]:
     """
-    (CORRECTED) Detects linkages and correctly separates glycosylation sites from
-    glycosidic bonds.
+    (CORRECTED) Detects linkages.
+    - Enforces Intra-chain only for Glycan-Glycan.
+    - Prioritizes valid configs > plausible errors > distance errors.
     """
     threshold = 2.0
-    glycosidic_conns_temp: List[GlycoConnection] = []
+    
+    # Key: Tuple[sorted((chain1, res1), (chain2, res2))]
+    # Value: GlycoConnection
+    best_glycosidic_conns: Dict[Tuple[Tuple[str, int], Tuple[str, int]], GlycoConnection] = {}
+    
     glycosylation_sites_temp: List[GlycosylationSiteConnection] = []
     site_stats = defaultdict(lambda: defaultdict(int))
     anomalous_sites = []
@@ -436,10 +379,11 @@ def detect_all_connections(
 
     flat_atoms = []
     all_coords = []
-    is_standard_aa = {
-        key: atoms_by_residue[key][0]['residue_name'] in standard_amino_acids
-        for key in atoms_by_residue if atoms_by_residue[key]
-    }
+    
+    is_standard_aa = {}
+    for key, atoms in atoms_by_residue.items():
+        if atoms:
+            is_standard_aa[key] = atoms[0]['residue_name'] in standard_amino_acids
 
     for res_key, atoms in atoms_by_residue.items():
         if not atoms: continue
@@ -461,78 +405,103 @@ def detect_all_connections(
         res2_key, is_aa2 = atom2_info['res_key'], atom2_info['is_aa']
 
         if res1_key == res2_key: continue
+        
+        # Skip Protein-Protein (irrelevant for glycan logic)
+        if is_aa1 and is_aa2: continue
 
-        # Case 1: Protein-Glycan linkage (Glycosylation Site)
-        if is_aa1 != is_aa2:
-            protein_info, glycan_info = (atom1_info, atom2_info) if is_aa1 else (atom2_info, atom1_info)
-            protein_atom_dict = protein_info['atom_dict']
-            glycan_atom_dict = glycan_info['atom_dict']
+        # --- Element-Based Directionality ---
+        a1 = atom1_info['atom_dict']
+        a2 = atom2_info['atom_dict']
+        el1 = a1['element'].upper()
+        el2 = a2['element'].upper()
+        
+        donor_info, acceptor_info = None, None
+        donor_atom, acceptor_atom = None, None
+        
+        if el1 == 'C' and el2 != 'C':
+            donor_info, acceptor_info = atom1_info, atom2_info
+            donor_atom, acceptor_atom = a1, a2
+        elif el2 == 'C' and el1 != 'C':
+            donor_info, acceptor_info = atom2_info, atom1_info
+            donor_atom, acceptor_atom = a2, a1
+        else:
+            continue
+
+        # Case 1: Protein-Glycan linkage
+        if donor_info['is_aa'] == False and acceptor_info['is_aa'] == True:
+            glycan_info = donor_info
+            protein_info = acceptor_info
             
-            anom_config_site = determine_anomeric_config_universal(
+            config_result = determine_anomeric_config_universal(
                 child_residue_dicts=atoms_by_residue[glycan_info['res_key']],
-                acceptor_atom_dict=protein_atom_dict,
-                donor_atom_dict=glycan_atom_dict
+                acceptor_atom_dict=acceptor_atom,
+                donor_atom_dict=donor_atom
             )
             
-            protein_res_name = protein_atom_dict['residue_name']
-            protein_res_id = protein_info['res_key'][1]
-            site_stats[protein_res_name][anom_config_site] += 1
+            final_anom = config_result if config_result in ['a', 'b'] else "other"
+            
+            # Stats logging
+            p_name = protein_info['atom_dict']['residue_name']
+            p_id = protein_info['res_key'][1]
+            site_stats[p_name][final_anom] += 1
+            
+            if 'no ring' in config_result:
+                no_ring_errors.append((pdb_id, p_name, p_id))
 
-            if 'no ring' in anom_config_site:
-                no_ring_errors.append((pdb_id, protein_res_name, protein_res_id))
-            else:
-                is_alpha_asn = (protein_res_name == "ASN" and anom_config_site == 'a')
-                is_beta_thr = (protein_res_name == "THR" and anom_config_site == 'b')
-                is_beta_ser = (protein_res_name == "SER" and anom_config_site == 'b')
-                if is_alpha_asn or is_beta_thr or is_beta_ser:
-                    config_str = 'alpha' if anom_config_site == 'a' else 'beta'
-                    anomalous_sites.append((pdb_id, protein_res_name, protein_res_id, config_str))
-            
-            # --- THE BUG WAS HERE ---
-            # The following line incorrectly added protein-glycan links to the sugar-sugar bond list.
-            # It has been REMOVED.
-            
-            # This is the CORRECT list for this type of connection.
             glycosylation_sites_temp.append(GlycosylationSiteConnection(
                 protein_chain_id=protein_info['res_key'][0], protein_res_id=protein_info['res_key'][1],
-                protein_atom_name=protein_atom_dict['atom_name'],
+                protein_atom_name=acceptor_atom['atom_name'],
                 glycan_chain_id=glycan_info['res_key'][0], glycan_res_id=glycan_info['res_key'][1],
-                glycan_atom_name=glycan_atom_dict['atom_name'],
+                glycan_atom_name=donor_atom['atom_name'],
+                anomeric=config_result 
             ))
 
-        # Case 2: Glycan-Glycan linkage (Glycosidic Bond)
-        elif not is_aa1 and not is_aa2:
-            a1_dict, a2_dict = atom1_info['atom_dict'], atom2_info['atom_dict']
-            parent_key, child_key, parent_atom, child_atom = (None, None, None, None)
+        # Case 2: Monosaccharide-Monosaccharide linkage
+        elif not donor_info['is_aa'] and not acceptor_info['is_aa']:
+            # STRICT FILTER: Glycan-Glycan bonds must be Intra-Chain
+            # (Assuming rechaining logic has already grouped connected glycans)
+            if donor_info['res_key'][0] != acceptor_info['res_key'][0]:
+                continue
+
+            config_result = determine_anomeric_config_universal(
+                child_residue_dicts=atoms_by_residue[donor_info['res_key']],
+                acceptor_atom_dict=acceptor_atom,
+                donor_atom_dict=donor_atom
+            )
             
-            config1 = determine_anomeric_config_universal(atoms_by_residue[res2_key], a1_dict, a2_dict)
-            if 'error' not in config1:
-                parent_key, child_key = res1_key, res2_key
-                parent_atom, child_atom = a1_dict, a2_dict
-                anom = config1
+            new_conn = GlycoConnection(
+                parent_chain_id=acceptor_info['res_key'][0], child_chain_id=donor_info['res_key'][0],
+                parent_res_id=acceptor_info['res_key'][1], child_res_id=donor_info['res_key'][1],
+                parent_acceptor_atom_name=acceptor_atom['atom_name'],
+                child_donor_atom_name=donor_atom['atom_name'], 
+                anomeric=config_result
+            )
+            
+            pair_key = tuple(sorted(((acceptor_info['res_key']), (donor_info['res_key']))))
+            
+            if pair_key not in best_glycosidic_conns:
+                best_glycosidic_conns[pair_key] = new_conn
             else:
-                config2 = determine_anomeric_config_universal(atoms_by_residue[res1_key], a2_dict, a1_dict)
-                if 'error' not in config2:
-                    parent_key, child_key = res2_key, res1_key
-                    parent_atom, child_atom = a2_dict, a1_dict
-                    anom = config2
+                existing = best_glycosidic_conns[pair_key]
+                existing_valid = existing.anomeric in ['a', 'b']
+                new_valid = new_conn.anomeric in ['a', 'b']
+                
+                # Prioritization Logic
+                if new_valid and not existing_valid:
+                    # Always prefer valid config over error
+                    best_glycosidic_conns[pair_key] = new_conn
+                elif not new_valid and not existing_valid:
+                    # Both are errors. Prefer the one that is NOT "too far".
+                    # "too far" indicates a random steric contact.
+                    # Other errors (e.g. "no ring") indicate the correct bond but bad topology.
+                    existing_too_far = "too far" in str(existing.anomeric)
+                    new_too_far = "too far" in str(new_conn.anomeric)
+                    
+                    if existing_too_far and not new_too_far:
+                        # Upgrade from a distance error to a topology error (implies correct atoms found)
+                        best_glycosidic_conns[pair_key] = new_conn
 
-            if parent_key:
-                glycosidic_conns_temp.append(GlycoConnection(
-                    parent_chain_id=parent_key[0], child_chain_id=child_key[0],
-                    parent_res_id=parent_key[1], child_res_id=child_key[1],
-                    parent_acceptor_atom_name=parent_atom['atom_name'],
-                    child_donor_atom_name=child_atom['atom_name'], anomeric=anom
-                ))
-
-    # Remove duplicate sugar-sugar connections
-    unique_glycosidic_conns: List[GlycoConnection] = []
-    seen_glyco_pairs: Set[Tuple[Tuple[str, int], Tuple[str, int]]] = set()
-    for conn in glycosidic_conns_temp:
-        pair = tuple(sorted(((conn.parent_chain_id, conn.parent_res_id), (conn.child_chain_id, conn.child_res_id))))
-        if pair not in seen_glyco_pairs:
-            unique_glycosidic_conns.append(conn)
-            seen_glyco_pairs.add(pair)
+    unique_glycosidic_conns = list(best_glycosidic_conns.values())
             
     return unique_glycosidic_conns, glycosylation_sites_temp, dict(site_stats), anomalous_sites, no_ring_errors
 
@@ -558,158 +527,78 @@ def build_residue_graph(atoms: List[AnomericAtom]) -> Dict[int, List[int]]:
         graph[atoms[j].idx].append(atoms[i].idx)
     return graph
 
-def find_and_order_ring(graph: Dict[int, List[int]], start_node_idx: int, atoms_map: Dict[int, AnomericAtom]) -> Optional[List[int]]:
+def get_atom_mass(element: str) -> float:
     """
-    Finds and canonically orders a 5 or 6-membered sugar ring containing the start node.
-    This version validates that the ring has the correct chemical composition
-    (n-1 carbons and 1 heteroatom).
+    Returns heuristic mass for priority sorting: O > N > C > others.
     """
-    from collections import deque
+    table = {'O': 16.0, 'N': 14.0, 'C': 12.0, 'S': 32.0, 'P': 31.0, 'H': 1.0}
+    return table.get(element.upper(), 0.0)
 
-    for ring_size in [6, 5]:
-        q = deque([(start_node_idx, [start_node_idx])])
-        visited_paths = {frozenset([start_node_idx])}
+def calculate_dihedral(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray, p4: np.ndarray) -> float:
+    """
+    Calculate the dihedral angle (in degrees) defined by 4 points.
+    Range: -180 to 180.
+    """
+    b1 = p2 - p1
+    b2 = p3 - p2
+    b3 = p4 - p3
 
-        while q:
-            curr_idx, path = q.popleft()
+    # Normalize b2
+    norm_b2 = np.linalg.norm(b2)
+    if norm_b2 < 1e-6:
+        return 0.0
+    b2_u = b2 / norm_b2
 
-            if len(path) == ring_size:
-                if start_node_idx in graph.get(curr_idx, []):
-                    ring_atoms = [atoms_map[i] for i in path]
-                    num_carbons = sum(1 for atom in ring_atoms if atom.element == 'C')
-                    num_heteroatoms = ring_size - num_carbons
+    # Normals to the planes
+    n1 = np.cross(b1, b2)
+    n2 = np.cross(b2, b3)
 
-                    is_valid_sugar_ring = (ring_size == 6 and num_carbons == 5 and num_heteroatoms == 1) or \
-                                          (ring_size == 5 and num_carbons == 4 and num_heteroatoms == 1)
+    # Cartesian coordinates of the angle
+    x = np.dot(n1, n2)
+    y = np.dot(np.cross(n1, n2), b2_u)
 
-                    if not is_valid_sugar_ring:
-                        continue # Ring found, but it's not a valid sugar ring.
+    angle_rad = np.arctan2(y, x)
+    return np.degrees(angle_rad)
 
-                    # Ring is valid, now order it
-                    c1_neighbors_in_ring = [idx for idx in graph.get(start_node_idx, []) if idx in path]
-                    c2_candidate = -1
-                    # Find the neighbor that is NOT the ring oxygen to start the walk
-                    for neighbor_idx in c1_neighbors_in_ring:
-                        if atoms_map[neighbor_idx].element != 'O':
-                             c2_candidate = neighbor_idx
-                             break
-                    
-                    if c2_candidate == -1:
-                        continue # Could not determine walk direction
+# --- Graph and Topology Functions ---
 
-                    ordered_ring = [start_node_idx, c2_candidate]
-                    prev_node, curr_node = start_node_idx, c2_candidate
-                    while len(ordered_ring) < ring_size:
-                        found_next = False
-                        for neighbor in graph.get(curr_node, []):
-                            if neighbor in path and neighbor != prev_node:
-                                ordered_ring.append(neighbor)
-                                prev_node, curr_node = curr_node, neighbor
-                                found_next = True
-                                break
-                        if not found_next:
-                             ordered_ring = [] # Should not happen in a valid ring
-                             break
-                    
-                    if ordered_ring:
-                        return ordered_ring
-
-                continue
-
-            for neighbor_idx in graph.get(curr_idx, []):
-                # This check prevents walking backwards immediately
-                if len(path) > 1 and neighbor_idx == path[-2]:
+def find_cycle_indices(graph: Dict[int, List[int]]) -> Set[int]:
+    """
+    Finds a single cycle in the graph using DFS.
+    Returns a set of atom indices comprising the ring.
+    Adapted from anomeric_test.py.
+    """
+    visited = set()
+    
+    # Sort keys for deterministic behavior
+    for start_node in sorted(graph.keys()):
+        if start_node in visited:
+            continue
+            
+        # Stack: (current_node, parent_node, path_list)
+        stack = [(start_node, -1, [start_node])]
+        
+        while stack:
+            curr, parent, path = stack.pop()
+            
+            if curr not in visited:
+                visited.add(curr)
+                
+            for neighbor in sorted(graph[curr]):
+                if neighbor == parent:
                     continue
                 
-                new_path_set = frozenset(path + [neighbor_idx])
-                if new_path_set not in visited_paths:
-                    q.append((neighbor_idx, path + [neighbor_idx]))
-                    visited_paths.add(new_path_set)
-    return None
-
-def _compute_ring_normal(ordered_ring_indices: List[int], atoms_map: Dict[int, AnomericAtom]) -> Optional[np.ndarray]:
-    """
-    Compute a stable ring-plane normal via PCA of ring atom positions.
-    Orientation is made deterministic using a cross product reference.
-    """
-    try:
-        coords = np.array([atoms_map[i].coords for i in ordered_ring_indices], dtype=float)
-        centroid = coords.mean(axis=0)
-        X = coords - centroid
-        cov = X.T @ X
-        w, v = np.linalg.eigh(cov)
-        n = v[:, np.argmin(w)]
-        # Fix orientation using first/last edges as reference
-        a = coords[1] - coords[0]
-        b = coords[-2] - coords[0]
-        ref = np.cross(a, b)
-        if np.dot(ref, n) < 0:
-            n = -n
-        norm = np.linalg.norm(n)
-        if norm < 1e-9:
-            return None
-        return n / norm
-    except Exception:
-        return None
-
-def _signed_projection(n: np.ndarray, vec: np.ndarray) -> float:
-    """Signed projection of vec onto unit normal n."""
-    return float(np.dot(n, vec))
-
-def _find_heaviest_exocyclic_substituent(
-    target_atom: AnomericAtom,
-    ring_indices: Set[int],
-    graph: Dict[int, List[int]],
-    atoms_map: Dict[int, AnomericAtom]
-) -> Optional[AnomericAtom]:
-    """
-    Finds the heaviest exocyclic substituent attached to a target atom based on atomic number.
-    """
-    exocyclic_neighbors = [idx for idx in graph.get(target_atom.idx, []) if idx not in ring_indices]
-    if not exocyclic_neighbors:
-        return None
-
-    best_substituent = None
-    max_atomic_num = -1
-
-    for nbr_idx in exocyclic_neighbors:
-        neighbor_atom = atoms_map.get(nbr_idx)
-        if not neighbor_atom: continue
-        
-        atomic_num = ATOMIC_NUMBERS.get(neighbor_atom.element.upper(), 0)
-        if atomic_num > max_atomic_num:
-            max_atomic_num = atomic_num
-            best_substituent = neighbor_atom
+                if neighbor in path:
+                    # Cycle detected
+                    cycle_start_index = path.index(neighbor)
+                    cycle_path = path[cycle_start_index:]
+                    # Basic chemical ring filter (e.g. usually 5 or 6 atoms)
+                    if len(cycle_path) >= 3:
+                        return set(cycle_path)
+                else:
+                    stack.append((neighbor, curr, path + [neighbor]))
     
-    return best_substituent
-
-def _find_c5_reference_substituent(
-    ordered_ring_indices: List[int],
-    ring_set: Set[int],
-    graph: Dict[int, List[int]],
-    atoms_map: Dict[int, AnomericAtom]
-) -> Optional[Tuple[AnomericAtom, AnomericAtom]]:
-    """
-    (CORRECTED) Finds the reference vector based strictly on the C5 atom and its 
-    heaviest exocyclic substituent. Returns a tuple of (C5_atom, substituent_atom) 
-    or None if C5 is not found.
-    """
-    # Step 1: Invariantly search for the C5 atom within the ordered ring.
-    c5_atom = next((atoms_map[idx] for idx in ordered_ring_indices if atoms_map[idx].name.upper() == 'C5'), None)
-    
-    # Step 2: If C5 is not found, fail immediately. Do not fall back to C4.
-    if c5_atom is None:
-        return None
-        
-    # Step 3: Find the heaviest exocyclic substituent attached to the C5 atom.
-    heaviest_substituent = _find_heaviest_exocyclic_substituent(c5_atom, ring_set, graph, atoms_map)
-    
-    # Step 4: If no such substituent exists, fail.
-    if heaviest_substituent is None:
-        return None
-        
-    # Step 5: Return the valid (C5 atom, substituent atom) pair.
-    return (c5_atom, heaviest_substituent)
+    return set()
 
 def determine_anomeric_config_universal(
     child_residue_dicts: List[Dict],
@@ -717,79 +606,117 @@ def determine_anomeric_config_universal(
     donor_atom_dict: Dict
 ) -> str:
     """
-    (REVISED) Unified α/β assignment using a C5-based reference rule and robust
-    ring validation.
+    Determines Alpha/Beta configuration using the dihedral angle quartet method.
+    Returns 'a', 'b', or a descriptive error string.
     """
-    # Adapter to convert dicts to AnomericAtom objects
-    child_residue_atoms: List[AnomericAtom] = [
-        AnomericAtom(
+    if not child_residue_dicts:
+        return "error (empty residue)"
+        
+    # 1. Adapter to convert dicts to AnomericAtom objects
+    heavy_atoms = []
+    for a in child_residue_dicts:
+        if a['element'].upper() == 'H': continue
+        heavy_atoms.append(AnomericAtom(
             idx=a['atom_number'], name=a['atom_name'], res_name=a['residue_name'],
             coords=np.array([a['x'], a['y'], a['z']]), element=a['element']
-        ) for a in child_residue_dicts
-    ]
+        ))
+    
     acceptor_atom = AnomericAtom(
         idx=acceptor_atom_dict['atom_number'], name=acceptor_atom_dict['atom_name'], res_name=acceptor_atom_dict['residue_name'],
         coords=np.array([acceptor_atom_dict['x'], acceptor_atom_dict['y'], acceptor_atom_dict['z']]), element=acceptor_atom_dict['element']
     )
-    donor_atom = AnomericAtom(
-        idx=donor_atom_dict['atom_number'], name=donor_atom_dict['atom_name'], res_name=donor_atom_dict['residue_name'],
-        coords=np.array([donor_atom_dict['x'], donor_atom_dict['y'], donor_atom_dict['z']]), element=donor_atom_dict['element']
-    )
+    
+    if not heavy_atoms:
+        return "error (no heavy atoms)"
+
+    atoms_map = {a.idx: a for a in heavy_atoms}
 
     try:
-        graph = build_residue_graph(child_residue_atoms)
-        atoms_map = {a.idx: a for a in child_residue_atoms}
+        # 2. Find the cycle
+        graph = build_residue_graph(heavy_atoms)
+        ring_indices = find_cycle_indices(graph)
         
-        ordered_ring_indices = find_and_order_ring(graph, donor_atom.idx, atoms_map)
-        if not ordered_ring_indices or len(ordered_ring_indices) not in [5, 6]:
-            return "error (no ring)"
+        if not ring_indices:
+            return "error (no ring detected)"
+            
+        # 3. Find Ring Non-Carbon Atom (Atom 3)
+        ring_non_carbons = [idx for idx in ring_indices if atoms_map[idx].element.upper() != 'C']
+        if not ring_non_carbons:
+            return "error (no ring heteroatom)"
+        atom_3_idx = ring_non_carbons[0] 
+        atom_3 = atoms_map[atom_3_idx]
         
-        if donor_atom.idx not in ordered_ring_indices:
-            return "error (donor not in ring)"
-
-        ring_set = set(ordered_ring_indices)
-        n = _compute_ring_normal(ordered_ring_indices, atoms_map)
-        if n is None: 
-            return "error (collinear plane)"
-
-        # Anomeric vector
-        donor_pos, acceptor_pos = donor_atom.coords, acceptor_atom.coords
-        sign_glyco = _signed_projection(n, acceptor_pos - donor_pos)
-        if abs(sign_glyco) < 1e-3: return "error (ambiguous plane)"
-
-        # Reference vector (C5/C4 based)
-        ref_pair = _find_c5_reference_substituent(ordered_ring_indices, ring_set, graph, atoms_map)
-        if ref_pair is None:
-            return "error (no C5/C4 reference)"
+        # 4. Find Anomeric Carbon (Atom 2)
+        atom_2_idx = -1
+        c1_candidates = [idx for idx in ring_indices if atoms_map[idx].name.strip().upper() == 'C1']
+        if c1_candidates:
+            atom_2_idx = c1_candidates[0]
+        else:
+            c2_candidates = [idx for idx in ring_indices if atoms_map[idx].name.strip().upper() == 'C2']
+            if c2_candidates:
+                atom_2_idx = c2_candidates[0]
         
-        ref_base_atom, ref_substituent_atom = ref_pair
-        ref_base_pos, ref_substituent_pos = ref_base_atom.coords, ref_substituent_atom.coords
-        sign_ref = _signed_projection(n, ref_substituent_pos - ref_base_pos)
-        if abs(sign_ref) < 1e-3: return "error (ambiguous plane)"
-
-        return "a" if (sign_glyco * sign_ref) < 0.0 else "b"
+        if atom_2_idx == -1:
+            return f"error (no anomeric C1/C2 found in ring {list(atoms_map[i].name for i in ring_indices)})"
+        atom_2 = atoms_map[atom_2_idx]
         
-    except Exception:
-        return "error (exception)"
+        # 5. Find Other Endocyclic Atom (Atom 4)
+        neighbors_of_3 = graph[atom_3_idx]
+        atom_4_idx = -1
+        for n_idx in neighbors_of_3:
+            if n_idx in ring_indices and n_idx != atom_2_idx:
+                atom_4_idx = n_idx
+                break
+        if atom_4_idx == -1:
+            return "error (topology mismatch for Atom 4)"
+        atom_4 = atoms_map[atom_4_idx]
+        
+        # 6. Find Anomeric Substituent (Atom 1)
+        # Check distance to ensure the acceptor is actually attached to the anomeric carbon
+        dist = np.linalg.norm(acceptor_atom.coords - atom_2.coords)
+        if dist > 2.5: 
+            return f"error (acceptor {acceptor_atom.name} is {dist:.1f}A from anomeric {atom_2.name}, too far)"
+            
+        neighbors_of_2 = graph[atom_2_idx]
+        exocyclic_candidates = []
+        for n_idx in neighbors_of_2:
+            if n_idx not in ring_indices:
+                exocyclic_candidates.append(atoms_map[n_idx])
+        
+        existing_indices = {a.idx for a in exocyclic_candidates}
+        if acceptor_atom.idx not in existing_indices:
+            exocyclic_candidates.append(acceptor_atom)
+            
+        if not exocyclic_candidates:
+            return "error (no exocyclic substituent)"
+            
+        exocyclic_candidates.sort(key=lambda a: get_atom_mass(a.element), reverse=True)
+        atom_1 = exocyclic_candidates[0]
+        
+        # 7. Calculate Dihedral Angle
+        angle = calculate_dihedral(atom_1.coords, atom_2.coords, atom_3.coords, atom_4.coords)
+        
+        # 8. Determine Configuration
+        if -95.0 <= angle <= 95.0:
+            return 'a'
+        elif (angle > 95.0 and angle < 225.0) or (angle < -95.0 and angle > -225.0):
+            return 'b'
+        else:
+            if abs(abs(angle) - 180.0) < 1e-3: 
+                return 'b'
+            return f"error (angle {angle:.1f} out of bounds)"
+
+    except Exception as e:
+        return f"error (exception: {str(e)})"
 
 def _determine_root_anomeric_config(
     atoms_by_residue: Dict[Tuple[str, int], List[Dict]],
     existing_connections: List[GlycoConnection]
 ) -> List[GlycoConnection]:
     """
-    (CORRECTED) Determines the anomeric configuration for root or lone monosaccharides
-    using a strict, element-agnostic, and topologically-aware method.
-
-    Logic:
-    1. First, search for a 'C1' atom.
-    2. If C1 is found and is validated to be endocyclic (part of the sugar ring),
-       the algorithm COMMITS to C1 as the anomeric carbon.
-       a. It then searches for C1's heaviest exocyclic substituent.
-       b. If a substituent is found, the anomeric config is calculated.
-       c. If no substituent is found, the config is None for this residue.
-       d. The process for this residue STOPS. It will NOT fall back to check C2.
-    3. ONLY IF C1 was not found OR was found to be exocyclic, the algorithm
-       proceeds to perform the same check for the 'C2' atom.
+    Determines the anomeric configuration for root or lone monosaccharides.
+    Adapts the quartet logic to find the local exocyclic substituent (e.g. O1) 
+    to serve as the 'acceptor' for the calculation.
     """
     all_glycan_residues = {
         key for key, atoms in atoms_by_residue.items()
@@ -808,65 +735,55 @@ def _determine_root_anomeric_config(
         chain_id, res_id = res_key
         residue_dicts = atoms_by_residue[res_key]
         
-        # Convert atom dictionaries to AnomericAtom objects for graph/ring functions
-        anomeric_atoms: List[AnomericAtom] = [
-            AnomericAtom(
-                idx=atom_dict['atom_number'], name=atom_dict['atom_name'],
-                res_name=atom_dict['residue_name'],
-                coords=np.array([atom_dict['x'], atom_dict['y'], atom_dict['z']]),
-                element=atom_dict['element']
-            ) for atom_dict in residue_dicts
-        ]
-        
-        if not anomeric_atoms:
+        # Filter heavy atoms for topology check
+        heavy_atoms = []
+        for a in residue_dicts:
+            if a['element'].upper() == 'H': continue
+            heavy_atoms.append(AnomericAtom(
+                idx=a['atom_number'], name=a['atom_name'], res_name=a['residue_name'],
+                coords=np.array([a['x'], a['y'], a['z']]), element=a['element']
+            ))
+
+        if not heavy_atoms:
             continue
 
-        atoms_map: Dict[int, AnomericAtom] = {a.idx: a for a in anomeric_atoms}
-        graph = build_residue_graph(anomeric_atoms)
+        atoms_map = {a.idx: a for a in heavy_atoms}
+        # Build graph using existing utility
+        graph = build_residue_graph(heavy_atoms)
         
-        donor_atom_dict, acceptor_atom_dict = None, None
-        anomeric_center_committed = False
+        # Find ring using new DFS utility
+        ring_indices = find_cycle_indices(graph)
+        if not ring_indices:
+            continue
 
-        # --- Step 1: Try C1 first ---
-        c1_atom_dict = find_atom_by_name(residue_dicts, 'C1')
-        if c1_atom_dict:
-            c1_anomeric_atom = atoms_map.get(c1_atom_dict['atom_number'])
-            if c1_anomeric_atom:
-                ordered_ring_indices = find_and_order_ring(graph, c1_anomeric_atom.idx, atoms_map)
+        donor_atom_dict = None
+        acceptor_atom_dict = None
+
+        # Determine Anomeric Carbon (C1 or C2 in ring)
+        c1_in_ring = next((idx for idx in ring_indices if atoms_map[idx].name.strip().upper() == 'C1'), None)
+        c2_in_ring = next((idx for idx in ring_indices if atoms_map[idx].name.strip().upper() == 'C2'), None)
+        
+        anomeric_idx = c1_in_ring if c1_in_ring is not None else c2_in_ring
+        
+        if anomeric_idx is not None:
+            anomeric_atom = atoms_map[anomeric_idx]
+            
+            # Find heaviest local exocyclic substituent to act as 'Acceptor'
+            neighbors = graph[anomeric_idx]
+            exocyclic_candidates = []
+            for n_idx in neighbors:
+                if n_idx not in ring_indices:
+                    exocyclic_candidates.append(atoms_map[n_idx])
+            
+            if exocyclic_candidates:
+                exocyclic_candidates.sort(key=lambda a: get_atom_mass(a.element), reverse=True)
+                best_substituent = exocyclic_candidates[0]
                 
-                # Check if C1 is endocyclic
-                if ordered_ring_indices and c1_anomeric_atom.idx in ordered_ring_indices:
-                    anomeric_center_committed = True # We commit to C1
-                    ring_set = set(ordered_ring_indices)
-                    
-                    # Find the heaviest exocyclic substituent, NOT specifically 'O1'
-                    heaviest_substituent = _find_heaviest_exocyclic_substituent(c1_anomeric_atom, ring_set, graph, atoms_map)
-                    
-                    if heaviest_substituent:
-                        donor_atom_dict = c1_atom_dict
-                        # Find the original dictionary for the acceptor atom
-                        acceptor_atom_dict = next(a for a in residue_dicts if a['atom_number'] == heaviest_substituent.idx)
+                # Retrieve original dicts
+                donor_atom_dict = next(a for a in residue_dicts if a['atom_number'] == anomeric_idx)
+                acceptor_atom_dict = next(a for a in residue_dicts if a['atom_number'] == best_substituent.idx)
 
-        # --- Step 2: ONLY if C1 was not a valid center, try C2 ---
-        if not anomeric_center_committed:
-            c2_atom_dict = find_atom_by_name(residue_dicts, 'C2')
-            if c2_atom_dict:
-                c2_anomeric_atom = atoms_map.get(c2_atom_dict['atom_number'])
-                if c2_anomeric_atom:
-                    ordered_ring_indices = find_and_order_ring(graph, c2_anomeric_atom.idx, atoms_map)
-                    
-                    # Check if C2 is endocyclic
-                    if ordered_ring_indices and c2_anomeric_atom.idx in ordered_ring_indices:
-                        ring_set = set(ordered_ring_indices)
-                        
-                        # Find the heaviest exocyclic substituent
-                        heaviest_substituent = _find_heaviest_exocyclic_substituent(c2_anomeric_atom, ring_set, graph, atoms_map)
-                        
-                        if heaviest_substituent:
-                            donor_atom_dict = c2_atom_dict
-                            acceptor_atom_dict = next(a for a in residue_dicts if a['atom_number'] == heaviest_substituent.idx)
-
-        # --- Step 3: If a valid anomeric C-substituent pair was found, calculate the configuration ---
+        # Calculate configuration if pair found
         if donor_atom_dict and acceptor_atom_dict:
             anom_config = determine_anomeric_config_universal(
                 child_residue_dicts=residue_dicts,
@@ -874,7 +791,6 @@ def _determine_root_anomeric_config(
                 donor_atom_dict=donor_atom_dict
             )
             
-            # Create a "pseudo-connection" to store this information
             pseudo_connections.append(GlycoConnection(
                 parent_chain_id=chain_id,
                 child_chain_id=chain_id,
@@ -914,8 +830,11 @@ def parse_glycoprotein_pdb(
     ccd: Mapping[str, Mol]
 ) -> Tuple[Optional[ParsedGlycoproteinData], Optional[Dict], Optional[Dict], Optional[List], Optional[List]]:
     """
-    (MODIFIED) Parses a PDB file by first applying glycan rechaining, then
-    correctly flagging specifically glycosylated amino acids as non-standard.
+    (MODIFIED) Parses a PDB file.
+    1. Rechains glycans.
+    2. Detects connections (using all atoms).
+    3. Removes Anomeric Oxygens (O1/O2) ONLY for internal/donor residues.
+    4. Parses residues with strict missing atom validation.
     """
     pdb_id = pdb_file.id
     try:
@@ -936,50 +855,77 @@ def parse_glycoprotein_pdb(
             
         rechained_atom_lines = _rechain_glycan_components(raw_atom_lines)
         atoms_by_residue, chain_types = parse_pdb_atoms_by_residue(rechained_atom_lines)
+        
         seqres_data = parse_seqres(pdb_file.path)
 
+        # --- STEP 1: Detect Connections FIRST ---
+        # We need to know connections to determine which residues are donors (children)
         glycosidic_conns, glycosylation_sites, site_stats, anomalous_sites, no_ring_errors = detect_all_connections(
             atoms_by_residue, pdb_id=pdb_id
         )
         
-        # --- FIX START ---
-        # Create a fast lookup set of protein residues that are glycosylated.
-        # The key is (chain_id, residue_number).
+        # --- STEP 2: Remove Anomeric Oxygens Conditionally ---
+        # Pass the connections so we know which are children (delete O) and which are roots (keep O)
+        preprocess_remove_anomeric_oxygen(atoms_by_residue, glycosidic_conns, glycosylation_sites)
+
         glycosylated_protein_res_keys = {
             (site.protein_chain_id, site.protein_res_id) for site in glycosylation_sites
         }
-        # --- FIX END ---
 
         root_pseudo_conns = _determine_root_anomeric_config(atoms_by_residue, glycosidic_conns)
         glycosidic_conns.extend(root_pseudo_conns)
         
         chains_to_residues: Dict[str, List[ParsedResidue]] = defaultdict(list)
+        
+        # Track chains (glycan trees) that fail validation
+        invalid_glycan_chain_ids: Set[str] = set()
 
         for (chain_id, res_num_pdb), pdb_atoms in atoms_by_residue.items():
+            # If this chain is already marked invalid, skip remaining residues
+            if chain_id in invalid_glycan_chain_ids:
+                continue
+
             if not pdb_atoms: continue
             res_name = pdb_atoms[0]['residue_name']
             
+            # Temporary index, corrected later
             temp_res_idx = len(chains_to_residues[chain_id])
             
             parsed_res = None
-            if res_name in standard_amino_acids:
-                parsed_res = parse_protein_residue(res_name, res_num_pdb, temp_res_idx, pdb_atoms, ccd)
-                
-                # --- FIX START ---
-                # Check if this standard amino acid is actually glycosylated. If so,
-                # create a new ParsedResidue object with the is_standard flag set to False.
-                res_key = (chain_id, res_num_pdb)
-                if res_key in glycosylated_protein_res_keys:
-                    parsed_res = replace(parsed_res, is_standard=False)
-                # --- FIX END ---
-
-            elif res_name in ccd: # Handles glycans and unnatural amino acids
-                parsed_res = parse_glycan_residue(res_name, res_num_pdb, temp_res_idx, pdb_atoms, ccd, name_map, inverse_name_map)
             
+            try:
+                if res_name in standard_amino_acids:
+                    parsed_res = parse_protein_residue(res_name, res_num_pdb, temp_res_idx, pdb_atoms, ccd)
+                    res_key = (chain_id, res_num_pdb)
+                    if res_key in glycosylated_protein_res_keys:
+                        parsed_res = replace(parsed_res, is_standard=False)
+
+                elif res_name in ccd: 
+                    # This might raise ValueError if missing atoms >= 2
+                    parsed_res = parse_glycan_residue(res_name, res_num_pdb, temp_res_idx, pdb_atoms, ccd, name_map, inverse_name_map)
+            
+            except ValueError as ve:
+                # Handle specific missing atom error localized to this chain
+                if "CRITICAL_MISSING_ATOMS" in str(ve):
+                    print(f"[{pdb_id}] Dropping Glycan Chain '{chain_id}' due to malformed residue {res_name} (ID: {res_num_pdb}): {ve}")
+                    invalid_glycan_chain_ids.add(chain_id)
+                    # Remove any residues collected for this chain so far
+                    if chain_id in chains_to_residues:
+                        del chains_to_residues[chain_id]
+                    parsed_res = None
+                    continue
+                else:
+                    # Propagate other unexpected errors
+                    raise ve
+
             if parsed_res:
                 chains_to_residues[chain_id].append(parsed_res)
         
+        # Process missing protein residues (SEQRES)
         for chain_id, mol_type in chain_types.items():
+            # If a protein chain was somehow marked invalid (unlikely via glycan logic), skip it
+            if chain_id in invalid_glycan_chain_ids: continue 
+
             if mol_type == "PROTEIN" and chain_id in seqres_data:
                 full_sequence = seqres_data[chain_id]
                 observed_res_nums = {r.orig_idx for r in chains_to_residues[chain_id]}
@@ -989,6 +935,19 @@ def parse_glycoprotein_pdb(
                         parsed_res = parse_protein_residue(res_name, res_num_pdb, res_idx, None, ccd)
                         if parsed_res:
                             chains_to_residues[chain_id].append(parsed_res)
+
+        # Filter connections to remove invalid chains
+        filtered_glycosidic_conns = [
+            c for c in glycosidic_conns 
+            if c.parent_chain_id not in invalid_glycan_chain_ids 
+            and c.child_chain_id not in invalid_glycan_chain_ids
+        ]
+        
+        filtered_glycosylation_sites = [
+            s for s in glycosylation_sites
+            if s.glycan_chain_id not in invalid_glycan_chain_ids
+            # Note: We assume protein chains didn't trigger CRITICAL_MISSING_ATOMS
+        ]
 
         parsed_chains: Dict[str, ParsedChain] = {}
         for chain_id, res_list in chains_to_residues.items():
@@ -1008,8 +967,8 @@ def parse_glycoprotein_pdb(
 
         return ParsedGlycoproteinData(
             pdb_id=pdb_id, chains=parsed_chains,
-            glycosidic_connections=glycosidic_conns,
-            glycosylation_sites=glycosylation_sites
+            glycosidic_connections=filtered_glycosidic_conns,
+            glycosylation_sites=filtered_glycosylation_sites
         ), None, site_stats, anomalous_sites, no_ring_errors
 
     except Exception as e:
@@ -1060,6 +1019,87 @@ def _parse_unresolved_ccd_residue(
         is_standard=False, is_present=False
     )
 
+def preprocess_remove_anomeric_oxygen(
+    atoms_by_residue: Dict[Tuple[str, int], List[Dict]],
+    glycosidic_conns: List[GlycoConnection],
+    glycosylation_sites: List[GlycosylationSiteConnection]
+) -> None:
+    """
+    (MODIFIED) Removes the anomeric oxygen (O1 or O2) ONLY if the monosaccharide
+    is a donor (child) in a glycosidic linkage or a protein-glycan bond.
+    
+    If the residue is a Root or Lone monosaccharide, the anomeric oxygen is preserved.
+    """
+    # 1. Identify all residues that are children (donors)
+    # These residues MUST have their anomeric oxygen removed to form the bond.
+    child_residue_keys = set()
+
+    for conn in glycosidic_conns:
+        child_residue_keys.add((conn.child_chain_id, conn.child_res_id))
+    
+    for site in glycosylation_sites:
+        child_residue_keys.add((site.glycan_chain_id, site.glycan_res_id))
+
+    # 2. Iterate through all residues
+    for res_key, atoms in atoms_by_residue.items():
+        if not atoms:
+            continue
+            
+        res_name = atoms[0]['residue_name']
+        
+        # Only process Glycans
+        if res_name not in MONO_TYPE_MAP or MONO_TYPE_MAP[res_name] == "OTHER":
+            continue
+
+        # CRITICAL CHANGE: If this glycan is NOT a child (it is a root or lone),
+        # we skip deletion to preserve the O1/O2.
+        if res_key not in child_residue_keys:
+            continue
+
+        # Convert to temporary objects for graph building
+        heavy_atoms = []
+        for a in atoms:
+            if a['element'].upper() == 'H': continue
+            heavy_atoms.append(AnomericAtom(
+                idx=a['atom_number'], name=a['atom_name'], res_name=a['residue_name'],
+                coords=np.array([a['x'], a['y'], a['z']]), element=a['element']
+            ))
+
+        if len(heavy_atoms) < 3:
+            continue
+
+        atoms_map = {a.idx: a for a in heavy_atoms}
+        
+        # 3. Build Graph & Find Ring
+        graph = build_residue_graph(heavy_atoms)
+        ring_indices = find_cycle_indices(graph)
+        
+        if not ring_indices:
+            continue
+            
+        ring_atom_names = {atoms_map[idx].name.strip().upper() for idx in ring_indices}
+
+        target_removal_atom = None
+
+        # 4. Determine Anomeric Carbon based on Ring Composition
+        if 'C1' in ring_atom_names:
+            # Standard Aldose (Glucose, etc.) -> C1 is anomeric -> Remove O1
+            target_removal_atom = 'O1'
+        elif 'C2' in ring_atom_names and 'C1' not in ring_atom_names:
+            # Ketose / Sialic Acid (SIA, KDO) -> C2 is anomeric -> Remove O2
+            target_removal_atom = 'O2'
+
+        # 5. Delete the specific oxygen if it exists
+        if target_removal_atom:
+            atoms_to_keep = []
+            for atom in atoms:
+                if atom['atom_name'].strip().upper() == target_removal_atom:
+                    continue # Skip (Delete) this atom
+                atoms_to_keep.append(atom)
+            
+            # Update the dictionary in place
+            atoms_by_residue[res_key] = atoms_to_keep
+            
 # --- This is a new helper function for parsing glycan residues (extracted from old logic) ---
 def parse_glycan_residue(
     res_name: str,
@@ -1071,65 +1111,110 @@ def parse_glycan_residue(
     inverse_name_map: Dict,
 ) -> ParsedResidue:
     """
-    (MODIFIED) Parses a glycan residue, using idealized CCD coordinates for the
-    'conformer' field to provide a good starting structure for stitching.
+    (MODIFIED) Parses a glycan residue.
+    
+    Includes a strict check: If MORE than 1 atom is missing relative to the CCD,
+    it raises a ValueError to stop parsing the file.
     """
-    ref_mol_no_h = AllChem.RemoveHs(ccd[res_name], sanitize=False)
+    # 1. Determine the Ground Truth Reference Name
+    lookup_name = const.ANOMER_REF_MAP.get(res_name, res_name)
+    
+    if lookup_name not in ccd:
+        lookup_name = res_name
+
+    if lookup_name not in ccd:
+        return ParsedResidue(
+            name=res_name, type=const.token_ids["UNK"], idx=res_idx,
+            atoms=[], bonds=[], orig_idx=res_num_pdb,
+            atom_center=0, atom_disto=0, is_standard=False, is_present=False
+        )
+
+    # 2. Prepare Reference Molecule
+    ref_mol_no_h = AllChem.RemoveHs(ccd[lookup_name], sanitize=False)
     for atom in ref_mol_no_h.GetAtoms():
         if not atom.HasProp("name"):
             atom.SetProp("name", f"{atom.GetSymbol()}{atom.GetIdx()+1}")
 
-    # --- CHANGE START ---
-    # Get the reference conformer from the CCD molecule
     try:
         ref_conformer = get_conformer(ref_mol_no_h)
     except ValueError:
-        print(f"Warning: No CCD conformer found for glycan residue '{res_name}'. Using zero vectors for conformer.", file=sys.stderr)
+        print(f"Warning: No CCD conformer found for glycan residue '{lookup_name}'.", file=sys.stderr)
         ref_conformer = None
-    # --- CHANGE END ---
 
     parsed_atoms_list: List[ParsedAtom] = []
     pdb_atom_map = {a['atom_name'].upper(): a for a in pdb_atoms}
     unk_chirality = const.chirality_type_ids.get(const.unk_chirality_type, 0)
 
+    ccd_idx_to_new_idx: Dict[int, int] = {}
+    new_idx_counter = 0
+    
+    # --- NEW: Missing Atom Counter ---
+    missing_atom_count = 0 
+
     for ref_idx, ref_atom in enumerate(ref_mol_no_h.GetAtoms()):
         ref_atom_name_ccd = ref_atom.GetProp("name")
         ref_atom_name_ccd_upper = ref_atom_name_ccd.upper()
+        
         pdb_atom_dict = pdb_atom_map.get(ref_atom_name_ccd_upper)
         if pdb_atom_dict is None:
             unmapped_pdb_name = inverse_name_map.get(res_name, {}).get(ref_atom_name_ccd_upper)
             if unmapped_pdb_name:
                 pdb_atom_dict = pdb_atom_map.get(unmapped_pdb_name)
 
-        # Get ground truth coordinates from the PDB (for loss calculation)
-        coords = tuple(pdb_atom_dict.get(c, 0.0) for c in 'xyz') if pdb_atom_dict else (0.0, 0.0, 0.0)
+        # If still None, it is missing
+        if pdb_atom_dict is None:
+            missing_atom_count += 1
+            continue
 
-        # --- CHANGE START ---
-        # Get idealized conformer coordinates from CCD (for initial structure guess)
+        coords = tuple(pdb_atom_dict.get(c, 0.0) for c in 'xyz')
+
         if ref_conformer:
             ref_coords_rdkit = ref_conformer.GetAtomPosition(ref_atom.GetIdx())
             conformer_coords = (ref_coords_rdkit.x, ref_coords_rdkit.y, ref_coords_rdkit.z)
         else:
             conformer_coords = (0.0, 0.0, 0.0)
-        # --- CHANGE END ---
 
         parsed_atoms_list.append(ParsedAtom(
-            name=ref_atom_name_ccd, element=ref_atom.GetAtomicNum(), charge=ref_atom.GetFormalCharge(),
+            name=ref_atom_name_ccd, 
+            element=ref_atom.GetAtomicNum(), 
+            charge=ref_atom.GetFormalCharge(),
             coords=coords,
-            conformer=conformer_coords, # Use the idealized CCD conformer
-            is_present=bool(pdb_atom_dict),
+            conformer=conformer_coords, 
+            is_present=True,
             chirality=const.chirality_type_ids.get(ref_atom.GetChiralTag(), unk_chirality),
         ))
+        
+        ccd_idx_to_new_idx[ref_atom.GetIdx()] = new_idx_counter
+        new_idx_counter += 1
 
-    parsed_bonds_list = [
-        ParsedBond(
-            atom_1=bond.GetBeginAtomIdx(), atom_2=bond.GetEndAtomIdx(),
-            type=const.bond_type_ids.get(bond.GetBondType().name, const.bond_type_ids[const.unk_bond_type])
-        ) for bond in ref_mol_no_h.GetBonds()
-    ]
+    # --- NEW: Strict Validation Check ---
+    # We expect exactly 1 missing atom (the O1 or O2 we deleted). 
+    # If missing > 1, it means the PDB was already missing atoms.
+    if missing_atom_count >= 2:
+        raise ValueError(f"CRITICAL_MISSING_ATOMS: Residue {res_name} is missing {missing_atom_count} atoms (Threshold: < 2).")
 
-    center_idx = next((i for i, pa in enumerate(parsed_atoms_list) if pa.name.upper() == 'C1'), 0)
-    disto_idx = next((i for i, pa in enumerate(parsed_atoms_list) if pa.name.upper() in ["C4'", "C4"]), center_idx if len(parsed_atoms_list) <= 1 else 1)
+    parsed_bonds_list = []
+    unk_bond_type = const.bond_type_ids.get(const.unk_bond_type, 1)
+    
+    for bond in ref_mol_no_h.GetBonds():
+        old_idx1 = bond.GetBeginAtomIdx()
+        old_idx2 = bond.GetEndAtomIdx()
+        
+        if old_idx1 in ccd_idx_to_new_idx and old_idx2 in ccd_idx_to_new_idx:
+            new_idx1 = ccd_idx_to_new_idx[old_idx1]
+            new_idx2 = ccd_idx_to_new_idx[old_idx2]
+            bond_val = const.bond_type_ids.get(bond.GetBondType().name, unk_bond_type)
+            parsed_bonds_list.append(ParsedBond(new_idx1, new_idx2, bond_val))
+
+    try:
+        center_idx = next(i for i, pa in enumerate(parsed_atoms_list) if pa.name.upper() == 'C1')
+    except StopIteration:
+        center_idx = 0
+        
+    try:
+        disto_idx = next(i for i, pa in enumerate(parsed_atoms_list) if pa.name.upper() in ["C4'", "C4"])
+    except StopIteration:
+        disto_idx = center_idx if len(parsed_atoms_list) <= 1 else 1
 
     return ParsedResidue(
         name=res_name, type=const.token_ids.get(res_name, const.token_ids["UNK"]), idx=res_idx,
@@ -1289,9 +1374,10 @@ def assemble_glycoprotein_structure(
     cluster_id: int,
 ) -> Tuple[Dict[str, Any], Record]:
     """
-    (CORRECTED) Assembles all parsed data into final, dense numpy arrays,
-    correctly differentiating between true glycans and other non-standard residues
-    (like glycosylated amino acids) during the initial sorting phase.
+    (MODIFIED) Assembles structure arrays.
+    - Removed 'Start Assembly' prints.
+    - Removed 'Root Monosaccharide' prints.
+    - Retained 'CONFIG ERROR' prints for invalid non-root linkages.
     """
     pdb_id = parsed_data.pdb_id
     atom_rows, res_rows, chain_rows_tuples = [], [], []
@@ -1300,47 +1386,46 @@ def assemble_glycoprotein_structure(
     final_glycan_feature_map, final_atom_to_mono_idx_map = {}, {}
 
     atom_map: Dict[Tuple[str, int, str], int] = {}
-    res_map: Dict[Tuple[str, int], Tuple[int, int]] = {}
+    res_lookup_info: Dict[Tuple[str, int], Tuple[int, int, int]] = {} 
+    
     chain_map: Dict[str, int] = {}
-
     atom_offset, res_offset, chain_offset = 0, 0, 0
 
     protein_residues_by_chain = defaultdict(list)
     all_glycan_residues_with_orig_chain = []
-    res_lookup_map = {}
+    res_obj_map = {} 
 
     for chain_name, chain in parsed_data.chains.items():
         for res in chain.residues:
             res_key = (chain_name, res.orig_idx if res.orig_idx is not None else res.idx)
-            res_lookup_map[res_key] = res
+            res_obj_map[res_key] = res
             
             is_true_glycan = res.name in MONO_TYPE_MAP and MONO_TYPE_MAP[res.name] != "OTHER"
 
             if res.is_standard or not is_true_glycan:
-                # Path 1: Standard AAs AND non-standard, non-glycan residues (e.g., glycosylated ASN)
-                # are grouped with protein components.
                 protein_residues_by_chain[chain_name].append(res)
             else:
-                # Path 2: Only true monosaccharides are sent to the glycan processing list.
                 all_glycan_residues_with_orig_chain.append((chain_name, res))
-    # --- END OF CORRECTION ---
 
-    # --- Step 1: Process PROTEIN chains (and other atomized components) ---
+    # --- Step 1: Process PROTEIN chains ---
     for chain_name in sorted(protein_residues_by_chain.keys()):
         chain_residues = protein_residues_by_chain[chain_name]
         chain_residues.sort(key=lambda r: r.orig_idx)
 
-        chain_map[chain_name] = chain_offset
+        current_chain_idx = chain_offset
+        chain_map[chain_name] = current_chain_idx
         
         num_atoms_in_chain = sum(len(r.atoms) for r in chain_residues)
+        
         chain_rows_tuples.append((
-            chain_name, const.chain_type_ids["PROTEIN"], chain_offset, chain_offset, chain_offset,
+            chain_name, const.chain_type_ids["PROTEIN"], current_chain_idx, current_chain_idx, current_chain_idx,
             atom_offset, num_atoms_in_chain, res_offset, len(chain_residues), 0
         ))
         
         for res in chain_residues:
             res_key = (chain_name, res.orig_idx if res.orig_idx is not None else res.idx)
-            res_map[res_key] = (res_offset, atom_offset)
+            res_lookup_info[res_key] = (res_offset, atom_offset, current_chain_idx)
+            
             res_rows.append((
                 res.name, res.type, res.idx, atom_offset, len(res.atoms),
                 atom_offset + res.atom_center, atom_offset + res.atom_disto,
@@ -1349,7 +1434,11 @@ def assemble_glycoprotein_structure(
             
             for local_atom_idx, atom in enumerate(res.atoms):
                 atom_map[res_key + (atom.name,)] = atom_offset + local_atom_idx
-                atom_rows.append((convert_atom_name(atom.name), atom.element, atom.charge, atom.coords, atom.conformer, atom.is_present, atom.chirality))
+                atom_rows.append((
+                    convert_atom_name(atom.name), atom.element, atom.charge, 
+                    atom.coords, atom.conformer,
+                    atom.is_present, atom.chirality
+                ))
             
             for bond in res.bonds:
                 bond_rows.append((min(bond.atom_1, bond.atom_2) + atom_offset, max(bond.atom_1, bond.atom_2) + atom_offset, bond.type))
@@ -1361,94 +1450,175 @@ def assemble_glycoprotein_structure(
             if not (prev_res.is_present and next_res.is_present): continue
             prev_key = (chain_name, prev_res.orig_idx if prev_res.orig_idx is not None else prev_res.idx)
             next_key = (chain_name, next_res.orig_idx if next_res.orig_idx is not None else next_res.idx)
+            
             c_atom_key, n_atom_key = prev_key + ('C',), next_key + ('N',)
 
             if c_atom_key in atom_map and n_atom_key in atom_map:
                 atom_idx_c, atom_idx_n = atom_map[c_atom_key], atom_map[n_atom_key]
-                res_idx_prev, _ = res_map[prev_key]
-                res_idx_next, _ = res_map[next_key]
-                connection_rows.append((chain_offset, chain_offset, res_idx_prev, res_idx_next, atom_idx_c, atom_idx_n))
+                res_idx_prev, _, _ = res_lookup_info[prev_key]
+                res_idx_next, _, _ = res_lookup_info[next_key]
+                connection_rows.append((current_chain_idx, current_chain_idx, res_idx_prev, res_idx_next, atom_idx_c, atom_idx_n))
+        
         chain_offset += 1
 
     # --- Step 2: Process GLYCAN components ---
     glycan_components = _find_glycan_components(all_glycan_residues_with_orig_chain, parsed_data.glycosidic_connections)
-    orig_res_key_to_new_mono_info = {}
-
-    for component_res_keys in glycan_components:
-        final_glycan_chain_id = chain_offset
-        agg_chain_name = f"_GLYCAN_{final_glycan_chain_id}_"
-        chain_map[agg_chain_name] = final_glycan_chain_id
-
-        comp_res_with_chains = [(key[0], res_lookup_map[key]) for key in component_res_keys]
-        
-        agg_chain, gly_feat_map, atom_mono_map, res_key_mono_map = _aggregate_glycan_component(
-            pdb_id=pdb_id, component_residues_with_chains=comp_res_with_chains,
-            all_connections=parsed_data.glycosidic_connections, final_glycan_chain_idx=final_glycan_chain_id,
-            final_glycan_chain_name=agg_chain_name
-        )
-        
-        for res_key, mono_idx in res_key_mono_map.items():
-            orig_res_key_to_new_mono_info[res_key] = (final_glycan_chain_id, mono_idx)
-            res_map[res_key] = (res_offset, atom_offset)
-
-        final_glycan_feature_map.update(gly_feat_map)
-        final_atom_to_mono_idx_map.update(atom_mono_map)
-        
-        if agg_chain and agg_chain.residues:
-            glycan_res = agg_chain.residues[0]
-            new_chain_tuple = (
-                agg_chain.name, agg_chain.type, final_glycan_chain_id, final_glycan_chain_id, final_glycan_chain_id,
-                atom_offset, len(glycan_res.atoms), res_offset, 1, 0
-            )
-            chain_rows_tuples.append(new_chain_tuple)
-            
-            res_rows.append((glycan_res.name, glycan_res.type, 0, atom_offset, len(glycan_res.atoms),
-                             atom_offset + glycan_res.atom_center, atom_offset + glycan_res.atom_disto, False, True))
-            
-            for local_atom_idx, atom in enumerate(glycan_res.atoms):
-                atom_map[(agg_chain_name, 0, atom.name)] = atom_offset + local_atom_idx
-                atom_rows.append((convert_atom_name(atom.name), atom.element, atom.charge, atom.coords, atom.conformer, atom.is_present, atom.chirality))
-            
-            for bond in glycan_res.bonds:
-                bond_rows.append((min(bond.atom_1, bond.atom_2) + atom_offset, max(bond.atom_1, bond.atom_2) + atom_offset, bond.type))
-            
-            atom_offset += len(glycan_res.atoms)
-            res_offset += 1
-            chain_offset += 1
-
-    chains = np.array(chain_rows_tuples, dtype=Chain)
-
-    # --- Step 3: Create final glycosylation site entries ---
-    for i, conn in enumerate(parsed_data.glycosylation_sites):
-        prot_res_key = (conn.protein_chain_id, conn.protein_res_id)
-        glycan_orig_res_key = (conn.glycan_chain_id, conn.glycan_res_id)
-        
-        if prot_res_key in res_map and glycan_orig_res_key in orig_res_key_to_new_mono_info:
-            prot_res_idx, _ = res_map[prot_res_key]
-            glycan_chain_idx, mono_idx = orig_res_key_to_new_mono_info[glycan_orig_res_key]
-            
-            glycan_res_idx = chains[glycan_chain_idx]['res_idx']
-            prot_chain_idx = chain_map[conn.protein_chain_id]
-            
-            prot_atom_key = prot_res_key + (conn.protein_atom_name,)
-            glycan_agg_chain_name = chains[glycan_chain_idx]['name'].strip()
-            glycan_atom_key = (glycan_agg_chain_name, 0, conn.glycan_atom_name)
-
-            if prot_atom_key in atom_map and glycan_atom_key in atom_map:
-                atom_idx_prot = atom_map[prot_atom_key]
-                atom_idx_glycan = atom_map[glycan_atom_key]
-                connection_rows.append((prot_chain_idx, glycan_chain_idx, prot_res_idx, glycan_res_idx, atom_idx_prot, atom_idx_glycan))
-            
-            prot_chain_res_start_idx = chains[prot_chain_idx]['res_idx']
-            glycosylation_site_tuples.append((
-                prot_chain_idx, prot_res_idx - prot_chain_res_start_idx, conn.protein_atom_name,
-                glycan_chain_idx, mono_idx, conn.glycan_atom_name
-            ))
     
-    # --- Step 4: Create final numpy arrays ---
+    for component_res_keys in glycan_components:
+        current_chain_idx = chain_offset
+        agg_chain_name = f"G{current_chain_idx}" 
+        
+        sorted_keys = sorted(component_res_keys)
+        
+        total_atoms_in_tree = 0
+        for k in sorted_keys:
+             res = res_obj_map[k]
+             total_atoms_in_tree += len(res.atoms)
+
+        chain_rows_tuples.append((
+            agg_chain_name, const.chain_type_ids["NONPOLYMER"], current_chain_idx, current_chain_idx, current_chain_idx,
+            atom_offset, total_atoms_in_tree, res_offset, len(sorted_keys), 0
+        ))
+
+        atom_to_mono_idx_list = []
+        
+        for mono_idx_in_chain, res_key in enumerate(sorted_keys):
+            res = res_obj_map[res_key]
+            res_lookup_info[res_key] = (res_offset, atom_offset, current_chain_idx)
+            
+            res_rows.append((
+                res.name, res.type, mono_idx_in_chain, atom_offset, len(res.atoms),
+                atom_offset + res.atom_center, atom_offset + res.atom_disto,
+                False, res.is_present 
+            ))
+            
+            for local_atom_idx, atom in enumerate(res.atoms):
+                atom_map[res_key + (atom.name,)] = atom_offset + local_atom_idx
+                atom_rows.append((
+                    convert_atom_name(atom.name), atom.element, atom.charge, 
+                    atom.coords, atom.conformer,
+                    atom.is_present, atom.chirality
+                ))
+                atom_to_mono_idx_list.append(mono_idx_in_chain)
+
+            for bond in res.bonds:
+                bond_rows.append((
+                    min(bond.atom_1, bond.atom_2) + atom_offset, 
+                    max(bond.atom_1, bond.atom_2) + atom_offset, 
+                    bond.type
+                ))
+            
+            # --- ANOMERIC CONFIGURATION & LOGGING ---
+            anomeric_config = None
+            found_conn = None
+            
+            # 1. Check if Child in Sugar-Sugar Bond
+            for conn in parsed_data.glycosidic_connections:
+                if (conn.child_chain_id, conn.child_res_id) == res_key:
+                    if conn.parent_chain_id == conn.child_chain_id and conn.parent_res_id == conn.child_res_id:
+                        continue
+                    found_conn = conn
+                    break
+            
+            if found_conn:
+                raw_config = found_conn.anomeric
+                if raw_config in ['a', 'b']:
+                    anomeric_config = raw_config
+                else:
+                    # Print ONLY if it's a found connection with a bad config
+                    print(f"[{pdb_id}] [Assemble] CONFIG ERROR: {res.name} {res_key[0]}:{res_key[1]} linked to {found_conn.parent_chain_id}:{found_conn.parent_res_id}. Reason: {raw_config}")
+                    anomeric_config = None
+            
+            # 2. Check if Child in Protein-Sugar Bond
+            if anomeric_config is None and not found_conn:
+                found_site = None
+                for site in parsed_data.glycosylation_sites:
+                    if (site.glycan_chain_id, site.glycan_res_id) == res_key:
+                        found_site = site
+                        break
+                
+                if found_site:
+                    raw_config = found_site.anomeric
+                    if raw_config in ['a', 'b']:
+                        anomeric_config = raw_config
+                    else:
+                        # Print ONLY if it's a found connection with a bad config
+                        print(f"[{pdb_id}] [Assemble] CONFIG ERROR: {res.name} {res_key[0]}:{res_key[1]} linked to Protein {found_site.protein_chain_id}:{found_site.protein_res_id}. Reason: {raw_config}")
+                        anomeric_config = None
+                
+                # If neither found_conn nor found_site is present, it is a Root Monosaccharide.
+                # All print statements for this case have been removed.
+
+            final_glycan_feature_map[(current_chain_idx, mono_idx_in_chain)] = boltz.data.parse.schema.MonosaccharideFeatures(
+                asym_id=current_chain_idx,
+                ccd_code=res.name,
+                source_glycan_idx=0,
+                anomeric_config=anomeric_config
+            )
+
+            atom_offset += len(res.atoms)
+            res_offset += 1
+
+        final_atom_to_mono_idx_map[current_chain_idx] = np.array(atom_to_mono_idx_list, dtype=np.int32)
+        chain_offset += 1
+
+    # --- Step 3: Create Connections ---
+    for conn in parsed_data.glycosidic_connections:
+        if conn.parent_chain_id == conn.child_chain_id and conn.parent_res_id == conn.child_res_id:
+            continue
+
+        parent_key = (conn.parent_chain_id, conn.parent_res_id)
+        child_key = (conn.child_chain_id, conn.child_res_id)
+        
+        if parent_key in res_lookup_info and child_key in res_lookup_info:
+            parent_res_idx, parent_atom_start, parent_chain_idx = res_lookup_info[parent_key]
+            child_res_idx, child_atom_start, child_chain_idx = res_lookup_info[child_key]
+            
+            parent_res = res_obj_map[parent_key]
+            child_res = res_obj_map[child_key]
+            
+            p_atom_local = next((i for i, a in enumerate(parent_res.atoms) if a.name == conn.parent_acceptor_atom_name), None)
+            c_atom_local = next((i for i, a in enumerate(child_res.atoms) if a.name == conn.child_donor_atom_name), None)
+            
+            if p_atom_local is not None and c_atom_local is not None:
+                p_atom_global = parent_atom_start + p_atom_local
+                c_atom_global = child_atom_start + c_atom_local
+                connection_rows.append((parent_chain_idx, child_chain_idx, parent_res_idx, child_res_idx, p_atom_global, c_atom_global))
+
+    for i, conn in enumerate(parsed_data.glycosylation_sites):
+        prot_key = (conn.protein_chain_id, conn.protein_res_id)
+        glycan_key = (conn.glycan_chain_id, conn.glycan_res_id)
+        
+        if prot_key in res_lookup_info and glycan_key in res_lookup_info:
+            prot_res_idx, prot_atom_start, prot_chain_idx = res_lookup_info[prot_key]
+            glycan_res_idx, glycan_atom_start, glycan_chain_idx = res_lookup_info[glycan_key]
+            
+            prot_res = res_obj_map[prot_key]
+            glycan_res = res_obj_map[glycan_key]
+            
+            p_atom_local = next((i for i, a in enumerate(prot_res.atoms) if a.name == conn.protein_atom_name), None)
+            g_atom_local = next((i for i, a in enumerate(glycan_res.atoms) if a.name == conn.glycan_atom_name), None)
+            
+            if p_atom_local is not None and g_atom_local is not None:
+                p_atom_global = prot_atom_start + p_atom_local
+                g_atom_global = glycan_atom_start + g_atom_local
+                
+                connection_rows.append((prot_chain_idx, glycan_chain_idx, prot_res_idx, glycan_res_idx, p_atom_global, g_atom_global))
+                
+                mono_idx = res_rows[glycan_res_idx][2] 
+                prot_chain_tuple = chain_rows_tuples[prot_chain_idx]
+                prot_chain_start_res = prot_chain_tuple[7] 
+                
+                glycosylation_site_tuples.append((
+                    prot_chain_idx, prot_res_idx - prot_chain_start_res, conn.protein_atom_name,
+                    glycan_chain_idx, mono_idx, conn.glycan_atom_name
+                ))
+
+    # --- Step 4: Finalize Arrays ---
     atoms = np.array(atom_rows, dtype=Atom)
     bonds = np.array(sorted(list(set(bond_rows))), dtype=Bond) if bond_rows else np.array([], dtype=Bond)
     residues = np.array(res_rows, dtype=Residue)
+    chains = np.array(chain_rows_tuples, dtype=Chain)
     connections = np.array(connection_rows, dtype=Connection) if connection_rows else np.array([], dtype=Connection)
     glycosylation_sites_arr = np.array(glycosylation_site_tuples, dtype=GlycosylationSite) if glycosylation_site_tuples else None
 
@@ -1463,82 +1633,6 @@ def assemble_glycoprotein_structure(
     record = Record(id=pdb_id, structure=StructureInfo(num_chains=len(chains)), chains=chain_info_list, interfaces=[], inference_options=None)
     
     return npz_data, record
-
-def _aggregate_glycan_component(
-    pdb_id: str,
-    component_residues_with_chains: List[Tuple[str, ParsedResidue]],
-    all_connections: List[GlycoConnection],
-    final_glycan_chain_idx: int,
-    final_glycan_chain_name: str,
-) -> Tuple[ParsedChain, Dict, Dict, Dict]:
-    """
-    (REVISED) Aggregates a glycan component. The 'conformer' coordinates for all
-    atoms in this component are explicitly set to (0,0,0) to maintain the
-    glycan-specific heuristic. `coords` (from PDB) are preserved.
-    """
-
-    if not component_residues_with_chains:
-        return None, {}, {}, {}
-
-    res_map = {(chain_name, res.orig_idx): res for chain_name, res in component_residues_with_chains}
-    component_res_keys = set(res_map.keys())
-    connections_this_component = [
-        conn for conn in all_connections
-        if (conn.parent_chain_id, conn.parent_res_id) in component_res_keys and
-           (conn.child_chain_id, conn.child_res_id) in component_res_keys
-    ]
-    master_atoms, master_bonds = [], []
-    atom_to_mono_idx_list = []
-    residue_key_to_mono_idx = {}
-    glycan_feature_map = {}
-    atom_offsets_map = {}
-    atom_offset = 0
-    sorted_res_keys = sorted(list(component_res_keys))
-
-    for mono_idx, res_key in enumerate(sorted_res_keys):
-        res = res_map[res_key]
-        atom_offsets_map[res_key] = atom_offset
-        residue_key_to_mono_idx[res_key] = mono_idx
-
-        # --- CRITICAL FIX: Enforce (0,0,0) conformer for glycan components ---
-        for atom in res.atoms:
-            # Create a new atom with the conformer field zeroed out
-            zeroed_conformer_atom = replace(atom, conformer=(0.0, 0.0, 0.0))
-            master_atoms.append(zeroed_conformer_atom)
-        
-        atom_to_mono_idx_list.extend([mono_idx] * len(res.atoms))
-
-        for bond in res.bonds:
-            master_bonds.append(ParsedBond(bond.atom_1 + atom_offset, bond.atom_2 + atom_offset, bond.type))
-        
-        atom_offset += len(res.atoms)
-        
-        conn_as_child = next((c for c in connections_this_component if (c.child_chain_id, c.child_res_id) == res_key), None)
-        glycan_feature_map[(final_glycan_chain_idx, mono_idx)] = boltz.data.parse.schema.MonosaccharideFeatures(
-            asym_id=final_glycan_chain_idx, ccd_code=res.name, source_glycan_idx=0,
-            anomeric_config=conn_as_child.anomeric if conn_as_child else None
-        )
-
-    # ... (The rest of the function for adding inter-residue bonds is correct) ...
-    # (The final creation of ParsedResidue and ParsedChain is also correct)
-    for conn in connections_this_component:
-        parent_key = (conn.parent_chain_id, conn.parent_res_id)
-        child_key = (conn.child_chain_id, conn.child_res_id)
-        try:
-            parent_res, child_res = res_map[parent_key], res_map[child_key]
-            acceptor_idx = next(i for i, a in enumerate(parent_res.atoms) if a.name.upper() == conn.parent_acceptor_atom_name.upper())
-            donor_idx = next(i for i, a in enumerate(child_res.atoms) if a.name.upper() == conn.child_donor_atom_name.upper())
-            global_acceptor_idx = acceptor_idx + atom_offsets_map[parent_key]
-            global_donor_idx = donor_idx + atom_offsets_map[child_key]
-            master_bonds.append(ParsedBond(global_acceptor_idx, global_donor_idx, BOND_TYPE_SINGLE))
-        except StopIteration:
-            continue
-            
-    final_residue = ParsedResidue("GLYCAN", const.token_ids["UNK"], 0, master_atoms, master_bonds, 0, 0, min(1, len(master_atoms)-1), False, True)
-    final_chain = ParsedChain(final_glycan_chain_name, "", const.chain_type_ids["NONPOLYMER"], [final_residue], ["GLYCAN"])
-    atom_to_mono_idx_map = {final_glycan_chain_idx: np.array(atom_to_mono_idx_list, dtype=np.int32)}
-
-    return final_chain, glycan_feature_map, atom_to_mono_idx_map, residue_key_to_mono_idx
 
 # --- Main Processing Functions --#
 def finalize(outdir: Path) -> None:
@@ -1645,9 +1739,8 @@ def process_pdb_file(
 # --- Main Execution ---
 def main(args):
     """
-    (REVISED FOR DETAILED ANOMALY/ERROR SUMMARY) Main loop that aggregates
-    statistics and prints final summaries with specific examples for both
-    biochemically anomalous sites and "no ring" calculation errors.
+    (MODIFIED) Main loop that treats every input file as a unique cluster.
+    Clustering logic has been removed.
     """
     script_overall_start_time = time.time()
     args.outdir.mkdir(parents=True, exist_ok=True)
@@ -1663,54 +1756,32 @@ def main(args):
         print("No PDB files found. Exiting.")
         return 0
     
+    # Create PDBFile objects
     initial_tasks = [PDBFile(id=p.stem, path=p, cluster_num=0, frame_num=0) for p in all_pdb_paths]
     print(f"Found {len(initial_tasks)} PDB files to process.")
 
     use_parallel = args.num_processes > 1 and len(initial_tasks) > 1
     ccd_path_str = str(args.ccd_path.resolve())
     
-    print("\n--- Starting Pass 1: Generating canonical sequence keys ---")
-    id_to_sequence = {}
-    if use_parallel:
-        with multiprocessing.Pool(args.num_processes, initializer=worker_init, initargs=(ccd_path_str,)) as pool:
-            key_results = list(tqdm(pool.imap_unordered(get_glycan_sequence_key, initial_tasks), total=len(initial_tasks), desc="Generating Sequences"))
-    else:
-        worker_init(ccd_path_str)
-        key_results = [get_glycan_sequence_key(task) for task in tqdm(initial_tasks, desc="Generating Sequences (Serial)")]
+    # --- CHANGE: Clustering Removed ---
+    # We assign a unique cluster ID (index 'i') to every single file.
+    # We skip the sequence generation pass entirely.
     
-    sequencing_failures = 0
-    for pdb_id, sequence_key in key_results:
-        if sequence_key is not None:
-            id_to_sequence[pdb_id] = sequence_key
-        else:
-            id_to_sequence[pdb_id] = "_SEQ_FAIL_CLUSTER_"
-            sequencing_failures += 1
-
-    print("\n--- Clustering structures based on sequence keys ---")
-    sequence_to_ids = defaultdict(list)
-    for pdb_id, sequence_key in id_to_sequence.items():
-        sequence_to_ids[sequence_key].append(pdb_id)
-
-    id_to_cluster = {pdb_id: cluster_id for cluster_id, (_, pdb_ids) in enumerate(sequence_to_ids.items()) for pdb_id in pdb_ids}
+    print("\n--- Processing files (No Clustering / 1 Cluster per File) ---")
     
-    print("\n--- CLUSTERING SUMMARY ---")
-    print(f"Total files scanned: {len(initial_tasks)}")
-    print(f"Successfully sequenced: {len(id_to_sequence) - sequencing_failures}")
-    print(f"Failed to sequence (grouped): {sequencing_failures}")
-    print(f"Number of unique sequences (clusters): {len(sequence_to_ids)}")
-    
-    print("\n--- Starting Pass 2: Processing and saving files with cluster IDs ---")
-    final_processing_tasks = [(task, id_to_cluster.get(task.id)) for task in initial_tasks]
+    # The task format is (PDBFile_Object, Cluster_ID)
+    final_processing_tasks = [(task, i) for i, task in enumerate(initial_tasks)]
 
     results = []
     if final_processing_tasks:
         if use_parallel:
             process_func = partial(process_pdb_file, outdir=args.outdir)
+            # Initialize workers with CCD data
             with multiprocessing.Pool(args.num_processes, initializer=worker_init, initargs=(ccd_path_str,)) as pool:
-                results = list(tqdm(pool.imap_unordered(process_func, final_processing_tasks), total=len(final_processing_tasks), desc="Final Processing"))
+                results = list(tqdm(pool.imap_unordered(process_func, final_processing_tasks), total=len(final_processing_tasks), desc="Processing"))
         else:
             worker_init(ccd_path_str)
-            results = [process_pdb_file(task, args.outdir) for task in tqdm(final_processing_tasks, desc="Final Processing (Serial)")]
+            results = [process_pdb_file(task, args.outdir) for task in tqdm(final_processing_tasks, desc="Processing (Serial)")]
     
     success_count = 0
     failed_files = []
@@ -1752,12 +1823,10 @@ def main(args):
             print(summary_line)
     print("----------------------------------------------------------------")
 
-    # --- New, more detailed summary block for anomalous sites ---
     print("\n\n--- Summary of Biochemically Anomalous Glycosylation Sites ---")
     if not global_anomalous_sites:
         print("No anomalous linkages (alpha-ASN, beta-THR, beta-SER) were found.")
     else:
-        # Separate examples by type
         alpha_asn_examples = [s for s in global_anomalous_sites if s[1] == 'ASN']
         beta_ser_examples = [s for s in global_anomalous_sites if s[1] == 'SER']
         beta_thr_examples = [s for s in global_anomalous_sites if s[1] == 'THR']
@@ -1769,18 +1838,8 @@ def main(args):
             for i, (pdb_id, res_name, res_num, config) in enumerate(alpha_asn_examples[:3]):
                 print(f"  - PDB ID: {pdb_id}, Residue: {res_name}{res_num}, Detected Config: {config}")
         
-        if beta_ser_examples:
-            print("\nDisplaying up to 3 examples of beta-SER linkages:")
-            for i, (pdb_id, res_name, res_num, config) in enumerate(beta_ser_examples[:3]):
-                print(f"  - PDB ID: {pdb_id}, Residue: {res_name}{res_num}, Detected Config: {config}")
-
-        if beta_thr_examples:
-            print("\nDisplaying up to 3 examples of beta-THR linkages:")
-            for i, (pdb_id, res_name, res_num, config) in enumerate(beta_thr_examples[:3]):
-                print(f"  - PDB ID: {pdb_id}, Residue: {res_name}{res_num}, Detected Config: {config}")
     print("----------------------------------------------------------------")
 
-    # --- New summary block for "no ring" errors ---
     print("\n\n--- Summary of 'No Ring' Calculation Errors ---")
     if not global_no_ring_errors:
         print("No 'no ring' errors were encountered during processing.")
@@ -1839,9 +1898,6 @@ def worker_init(ccd_path_str: str):
     except Exception as e:
         # Re-raise the exception with more context. This will be caught by the main process.
         raise RuntimeError(f"A worker process failed to initialize: {e}") from e
-
-
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pre-process specialized glycan PDB dataset.")
