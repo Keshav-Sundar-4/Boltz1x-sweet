@@ -15,7 +15,6 @@ from boltz.data import const
 from boltz.model.loss.diffusion import (
     smooth_lddt_loss,
     weighted_rigid_align,
-    compute_monosaccharide_mse_loss,
     Linkage_Loss,
 )
 from boltz.model.modules.encoders import (
@@ -758,7 +757,6 @@ class AtomDiffusion(Module):
         noised_atom_coords   = out_dict["noised_atom_coords"]
         sigmas               = out_dict["sigmas"]
 
-        # ... (code for resolved_atom_mask, align_weights, atom_coords_aligned_ground_truth is the same) ...
         resolved_atom_mask = feats["atom_resolved_mask"].repeat_interleave(multiplicity, 0)
 
         align_weights = noised_atom_coords.new_ones(noised_atom_coords.shape[:2])
@@ -798,20 +796,6 @@ class AtomDiffusion(Module):
         loss_weights = self.loss_weight(sigmas)
         mse_loss     = (mse_loss_per_sample * loss_weights).mean()
 
-        # --- Monosaccharide Local Alignment MSE ---
-        mono_mse_per_sample, mono_valid_mask, total_alignments = compute_monosaccharide_mse_loss(
-            pred_coords=denoised_atom_coords,
-            true_coords=feats["coords"],
-            feats=feats,
-            multiplicity=multiplicity,
-        )
-        if mono_valid_mask.any():
-            mono_weights = loss_weights * mono_valid_mask.float()
-            valid_count  = mono_valid_mask.sum().clamp(min=1)
-            mono_mse_loss_weighted = (mono_mse_per_sample * mono_weights).sum() / valid_count
-        else:
-            mono_mse_loss_weighted = self.zero
-
         # --- Smooth lDDT ---
         lddt_loss = self.zero
         if add_smooth_lddt_loss:
@@ -834,19 +818,16 @@ class AtomDiffusion(Module):
             device=denoised_atom_coords.device,
         )
 
-        # --- THIS IS THE KEY CHANGE ---
         # 1. Substitute `None` with a zero tensor for the `total_loss` calculation to fix DDP.
-        #    `self.zero` is a registered buffer, ensuring it's on the correct device.
         linkage_loss_for_total = linkage_loss if linkage_loss is not None else self.zero
 
-        # 2. Assemble the total loss. This graph is now consistent across all GPUs.
-        total_loss = mse_loss + mono_mse_loss_weighted + lddt_loss + linkage_loss_for_total
+        # 2. Assemble the total loss (Mono MSE removed).
+        total_loss = mse_loss + lddt_loss + linkage_loss_for_total
 
-        # 3. Keep the original `linkage_loss` (which can be `None`) in the breakdown dictionary for logging.
+        # 3. Keep the original `linkage_loss` (which can be `None`) in the breakdown dictionary.
         loss_breakdown = dict(
             mse_loss=mse_loss,
             smooth_lddt_loss=lddt_loss,
-            monosaccharide_mse_loss=mono_mse_loss_weighted,
             linkage_loss=linkage_loss, # This can be None
         )
 
@@ -857,7 +838,6 @@ class AtomDiffusion(Module):
             f"Loss Breakdown: \n"
             f"SmoothLDDT: {lddt_loss.item():<12.6f}\n"
             f"MSE:        {mse_loss.item():<12.6f}\n"
-            f"Mono_MSE:   {mono_mse_loss_weighted.item():<12.6f}\n"
             f"Linkage Loss:    {linkage_loss_for_print}\n\n",
             flush=True,
         )
