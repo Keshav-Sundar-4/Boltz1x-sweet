@@ -209,84 +209,167 @@ def _get_glycosylation_linkage_mask(feats: Dict[str, Any], device: torch.device)
 
     return linkage_mask
 
-class GlycanAtomTopologicalEncoder(nn.Module):
+class AnomericBondBias(nn.Module):
     """
-    (HIGHLY OPTIMIZED & UNLIMITED DISTANCE)
-    Computes a matrix of shortest-path topological distances between atoms for glycans.
-    This version builds a compact graph containing ONLY glycan atoms, runs Floyd-Warshall
-    on the small subgraph, and then scatters the results back to the full atom matrix.
-    This is significantly faster and more memory-efficient than the naive version.
+    Apply a learned pairwise bias to glycosidic bonds based on the anomeric
+    configuration (alpha/beta/other) of the monosaccharide that contributes
+    the anomeric carbon.
     
-    This modified version removes the artificial bond distance limit of 20, allowing
-    the model to use the true topological distance.
+    Updated to apply bias to:
+    1. Inter-residue glycosidic bonds (C1->Ox).
+    2. Intra-residue bonds where C1 connects to a terminal Oxygen (re-added OH).
     """
-    def __init__(self):
+
+    def __init__(self, token_z: int, num_anomeric_types: int = 3) -> None:
         super().__init__()
-        # self.max_dist is removed to allow for true, unlimited topological distances.
+        if token_z <= 0:
+            raise ValueError(f"token_z must be positive, got {token_z}")
+        if num_anomeric_types <= 0:
+            raise ValueError(
+                f"num_anomeric_types must be positive, got {num_anomeric_types}"
+            )
 
-    @torch.no_grad()
-    def forward(self, feats: Dict[str, Tensor]) -> Tensor:
+        # Linear map from anomeric one-hot -> bias vector in z space.
+        self.pairwise_bias_embedding = nn.Linear(
+            num_anomeric_types, token_z, bias=False
+        )
+        # Small init to act as a gentle bias.
+        nn.init.normal_(self.pairwise_bias_embedding.weight, mean=0.0, std=0.01)
+
+    # ------------------------- helpers -------------------------
+
+    @staticmethod
+    def _get_token_bonds(feats: Dict[str, Any]) -> torch.Tensor:
+        token_bonds = feats["token_bonds"]
+        if token_bonds.dim() == 4 and token_bonds.size(-1) == 1:
+            token_bonds = token_bonds.squeeze(-1)
+        if token_bonds.dim() != 3:
+            raise ValueError(
+                f"token_bonds must be [B, L, L] (or [B, L, L, 1]), got {token_bonds.shape}"
+            )
+        return token_bonds > 0.5
+
+    # ------------------------- forward -------------------------
+
+    def forward(self, z: torch.Tensor, feats: Dict[str, Any]) -> torch.Tensor:
         """
-        Calculates the topological distance matrix for glycan atoms.
+        Args:
+            z: Pairwise embeddings [B, L, L, token_z]
+            feats: feature dictionary
+        Returns:
+            z with anomeric biases added symmetrically to:
+            1. Inter-residue glycosidic bonds (Anomeric Carbon -> Next Residue).
+            2. Intra-residue anomeric bonds (Anomeric Carbon -> Heaviest Exocyclic Atom).
         """
-        infinite_dist = -1
-        device = feats["atom_pad_mask"].device
-        B, N_atom = feats["atom_pad_mask"].shape
+        if z.dim() != 4:
+            raise ValueError(f"z must be [B, L, L, Cz], got {z.shape}")
+
+        B, L, L2, Cz = z.shape
+        device = z.device
+
+        token_bonds = self._get_token_bonds(feats)  # [B, L, L]
+        token_to_mono_idx = feats["token_to_mono_idx"]  # [B, L]
+
+        # 1. Topology & Element Masks
+        mono_i = token_to_mono_idx.unsqueeze(2)  # [B, L, 1]
+        mono_j = token_to_mono_idx.unsqueeze(1)  # [B, 1, L]
         
-        is_glycan_atom = (feats["atom_mono_idx"] != -1)
+        # Valid residue tokens
+        source_is_mono = mono_i != -1
         
-        if not torch.any(is_glycan_atom):
-            return torch.full((B, N_atom, N_atom), infinite_dist, device=device, dtype=torch.long)
+        same_entity = (mono_i == mono_j) & source_is_mono
+        different_entity = (mono_i != mono_j) & source_is_mono & (mono_j != -1)
 
-        token_bonds = feats["token_bonds"].squeeze(-1) > 0
-        atom_to_token_idx = feats["atom_to_token"].argmax(-1)
+        # Get Element Types
+        ref_elem_oh = feats["ref_element"].float()
+        token_to_atom = feats["token_to_rep_atom"].float()
+        token_elem_oh = torch.einsum("bta,bae->bte", token_to_atom, ref_elem_oh)
+        token_elem_idx = token_elem_oh.argmax(dim=-1)
         
-        adj_matrix = token_bonds[
-            torch.arange(B, device=device).unsqueeze(1).unsqueeze(2),
-            atom_to_token_idx.unsqueeze(2),
-            atom_to_token_idx.unsqueeze(1)
-        ]
+        OXYGEN_INDEX = 8
+        is_oxygen = token_elem_idx == OXYGEN_INDEX  # [B, L]
+
+        # 2. Identify Specific Atom Names (C1 and C2)
+        # Convert ref_atom_name_chars [B, A, 4, 64] -> Token names [B, L, 4, 64]
+        ref_names = feats["ref_atom_name_chars"].float()
+        token_names = torch.einsum("bta,banv->btnv", token_to_atom, ref_names)
+        token_name_indices = token_names.argmax(dim=-1) # [B, L, 4]
+
+        # Targets (ASCII - 32): 'C'=35, '1'=17, '2'=18, Pad=0
+        c1_target = torch.tensor([35, 17, 0, 0], device=device).view(1, 1, 4)
+        c2_target = torch.tensor([35, 18, 0, 0], device=device).view(1, 1, 4)
+
+        is_named_c1 = (token_name_indices == c1_target).all(dim=-1) # [B, L]
+        is_named_c2 = (token_name_indices == c2_target).all(dim=-1) # [B, L]
+
+        # 3. Determine the Anomeric Carbon using Ring Topology
+        intra_bonds = token_bonds & same_entity
+        intra_degree = intra_bonds.float().sum(dim=2)
         
-        glycan_b_indices, glycan_a_indices = torch.where(is_glycan_atom)
-        adj_glycan_only = adj_matrix[glycan_b_indices, glycan_a_indices][:, glycan_a_indices]
+        # Ring Oxygen: Oxygen with >= 2 bonds within residue
+        is_ring_oxygen = is_oxygen & (intra_degree >= 2)
 
-        dist_glycan_list = []
-        for b in range(B):
-            b_mask = (glycan_b_indices == b)
-            if not torch.any(b_mask):
-                dist_glycan_list.append(torch.empty(0, 0, device=device, dtype=torch.float32))
-                continue
+        # Find which Carbon (C1 or C2) is bonded to the Ring Oxygen
+        connected_to_ring_o = (intra_bonds & is_ring_oxygen.unsqueeze(1)).any(dim=2)
+        is_anomeric_carbon = (is_named_c1 | is_named_c2) & connected_to_ring_o
 
-            adj_b = adj_glycan_only[b_mask][:, b_mask]
-            num_glycan_atoms_b = adj_b.shape[0]
-
-            dist = torch.full((num_glycan_atoms_b, num_glycan_atoms_b), float('inf'), device=device, dtype=torch.float32)
-            dist[adj_b] = 1.0
-            dist.diagonal().fill_(0)
-
-            for k in range(num_glycan_atoms_b):
-                dist = torch.min(dist, dist[:, k:k+1] + dist[k:k+1, :])
-            
-            dist_glycan_list.append(dist)
-
-        final_dist = torch.full((B, N_atom, N_atom), infinite_dist, device=device, dtype=torch.long)
+        # 4. Determine Target Bond Partners
         
-        for b in range(B):
-            b_mask = (glycan_b_indices == b)
-            if not torch.any(b_mask):
-                continue
+        # Partner A: Inter-residue (Glycosidic) bond
+        # Anomeric Carbon -> Any atom in a different residue
+        mask_inter = token_bonds & is_anomeric_carbon.unsqueeze(2) & different_entity
 
-            original_indices_b = glycan_a_indices[b_mask]
-            rows, cols = torch.meshgrid(original_indices_b, original_indices_b, indexing='ij')
-            
-            dist_b = dist_glycan_list[b]
-            dist_b[dist_b == float('inf')] = infinite_dist
-            
-            final_dist[b, rows, cols] = dist_b.long()
-
-        final_dist.diagonal(dim1=-2, dim2=-1).fill_(0)
+        # Partner B: Intra-residue Heaviest Exocyclic Atom
+        # Strategy:
+        # 1. Look at all neighbors of the anomeric carbon within the same residue.
+        # 2. Filter for EXOCYCLIC atoms. We approximate this by looking for atoms with intra_degree == 1.
+        #    (Ring atoms like C2 or O5 will have intra_degree >= 2).
+        # 3. Among candidates, select the one with the highest atomic number (Mass).
         
-        return final_dist
+        # [B, L_anom, L_neighbor]
+        anomeric_neighbors = intra_bonds & is_anomeric_carbon.unsqueeze(2)
+        
+        # Exocyclic Filter: Degree 1 within the residue (e.g. O1, OH, or exocyclic C in ketoses)
+        is_exocyclic = intra_degree == 1
+        exocyclic_candidates = anomeric_neighbors & is_exocyclic.unsqueeze(1) 
+
+        # Weight by Atomic Number (Oxygen=8 > Carbon=6 > Hydrogen=1)
+        atomic_weights = token_elem_idx.float() # [B, L]
+        candidate_weights = exocyclic_candidates * atomic_weights.unsqueeze(1) 
+        
+        # Find the max weight neighbor for each anomeric carbon
+        max_vals, max_indices = candidate_weights.max(dim=2) # [B, L_anom]
+        
+        # Reconstruct mask: (i, j) is True if i is Anomeric Carbon AND j is the Heaviest Exocyclic Neighbor
+        col_indices = torch.arange(L, device=device).view(1, 1, L).expand(B, L, L)
+        selected_neighbor_indices = max_indices.unsqueeze(2) 
+        
+        mask_intra = (
+            is_anomeric_carbon.unsqueeze(2) & 
+            (max_vals.unsqueeze(2) > 0) & # Ensure we actually found a candidate (mass > 0)
+            (col_indices == selected_neighbor_indices)
+        )
+
+        # Combine Masks
+        final_bias_mask = mask_inter | mask_intra
+
+        # 5. Compute and Apply Bias
+        anomeric_config = feats["mono_anomeric"]  # [B, L, num_anomeric_types]
+        pairwise_bias = self.pairwise_bias_embedding(anomeric_config)  # [B, L, Cz]
+        pairwise_bias = pairwise_bias.unsqueeze(2)  # [B, L, 1, Cz]
+
+        mask_expanded = final_bias_mask.unsqueeze(-1).to(pairwise_bias.dtype)
+        bias_to_add = pairwise_bias * mask_expanded  # [B, L, L, Cz]
+
+        # Symmetrize
+        z = z + bias_to_add + bias_to_add.transpose(1, 2)
+
+        # DDP-safe no-op
+        if not final_bias_mask.any():
+            z = z + sum(p.sum() * 0.0 for p in self.parameters())
+
+        return z
+
 
 #############################################################################################################
 #############################################################################################################
