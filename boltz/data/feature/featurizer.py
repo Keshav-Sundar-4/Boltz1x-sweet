@@ -489,7 +489,6 @@ def select_subset_from_mask(mask, p):
 
     return new_mask
 
-
 def process_token_features(
     data: Tokenized,
     max_tokens: Optional[int] = None,
@@ -557,7 +556,10 @@ def process_token_features(
     pocket_feature = (
         np.zeros(len(token_data)) + const.pocket_contact_info["UNSPECIFIED"]
     )
-    if inference_binder is not None:
+    
+    # FIX: Changed `if inference_binder is not None:` to `if inference_binder:`
+    # This ensures we skip this block if inference_binder is an empty list [].
+    if inference_binder:
         assert inference_pocket is not None
         pocket_residues = set(inference_pocket)
         for idx, token in enumerate(token_data):
@@ -673,8 +675,7 @@ def process_token_features(
         "cyclic_period": cyclic_period,
     }
     return token_features
-
-
+    
 def process_atom_features(
     data: Tokenized,
     atoms_per_window_queries: int = 32,
@@ -809,21 +810,6 @@ def process_atom_features(
     coord_data = np.concatenate(coord_data, axis=1)
     ref_space_uid = np.array(ref_space_uid)
 
-    # --- Process and select chirality for cropped atoms ---
-    all_atom_chirality = process_chirality_features(data)
-    
-    final_atom_indices = []
-    for token in data.tokens:
-        final_atom_indices.extend(range(token['atom_idx'], token['atom_idx'] + token['atom_num']))
-    
-    # Select the chirality values for the atoms present in the final cropped set
-    try:
-        cropped_atom_chirality_np = all_atom_chirality[final_atom_indices]
-        cropped_atom_chirality = from_numpy(cropped_atom_chirality_np)
-    except IndexError:
-        # Fallback to a zero tensor if indices are out of bounds.
-        cropped_atom_chirality = torch.zeros(len(final_atom_indices), dtype=torch.long)
-
     # --- Featurization ---
     ref_atom_name_chars = from_numpy(atom_data["name"]).long()
     ref_atom_name_raw = from_numpy(atom_data["name"].copy()) # For diagnostics
@@ -877,7 +863,6 @@ def process_atom_features(
         atom_to_token = pad_dim(atom_to_token, 0, pad_len_atoms)
         token_to_rep_atom = pad_dim(token_to_rep_atom, 1, pad_len_atoms)
         r_set_to_rep_atom = pad_dim(r_set_to_rep_atom, 1, pad_len_atoms)
-        cropped_atom_chirality = pad_dim(cropped_atom_chirality, 0, pad_len_atoms, value=0) # Pad chirality
 
     # Finalize mono-idx + CONSISTENT padding
     atom_mono_idx = from_numpy(np.array(new_atom_mono_idx_list, dtype=np.int64))
@@ -903,7 +888,6 @@ def process_atom_features(
         "ref_charge": ref_charge,
         "ref_atom_name_chars": ref_atom_name_chars,
         "ref_atom_name_raw": ref_atom_name_raw, # For diagnostics
-        "atom_chirality": cropped_atom_chirality, # NEW FEATURE
         "ref_space_uid": ref_space_uid,
         "coords": coords,
         "atom_mono_idx": atom_mono_idx,         
@@ -1242,110 +1226,6 @@ class BoltzFeaturizer:
             )
 
             return features
-
-_STEREOCHEMISTRY_DATA = None
-
-def get_stereochemistry_data():
-    """Loads and caches stereochemistry data from the installed package."""
-    global _STEREOCHEMISTRY_DATA
-    if _STEREOCHEMISTRY_DATA is None:
-        json_path = pkg_resources.resource_filename('boltz', 'data/stereochemistry.json')
-        try:
-            with open(json_path, 'r') as f:
-                _STEREOCHEMISTRY_DATA = json.load(f)
-                print("Successfully loaded stereochemistry.json.", flush=True)
-        except (FileNotFoundError, json.JSONDecodeError):
-            print("WARNING: stereochemistry.json not found or failed to load. Chirality features will be disabled.", flush=True)
-            _STEREOCHEMISTRY_DATA = {}
-    return _STEREOCHEMISTRY_DATA
-
-def decode_atom_name_from_offset_i1(encoded_name: np.ndarray) -> str:
-    """
-    (CORRECTED DECODER) Decodes an atom name from the 4i1 format where an
-    offset of 32 was subtracted from the ASCII value during encoding.
-    """
-    chars = []
-    for num in encoded_name:
-        # This is the inverse of the `ord(c) - 32` operation
-        char_code = num + 32
-        # A value of 0 in the array is padding, not a character
-        if num != 0:
-            # Check if the result is a printable character to avoid errors
-            if 32 <= char_code <= 126:
-                chars.append(chr(char_code))
-    # Join, strip whitespace, and convert to uppercase for consistent matching
-    return "".join(chars).strip().upper()
-
-def process_chirality_features(data: Tokenized) -> np.ndarray:
-    """
-    Generates a chirality feature vector for all atoms in the structure.
-    Returns a numpy array with values: 0 for None, 1 for R, 2 for S.
-    """
-    num_atoms_total = len(data.structure.atoms)
-    atom_chirality = np.zeros(num_atoms_total, dtype=np.int64)
-
-    stereo_data = get_stereochemistry_data()
-    glycan_feature_map = data.structure.glycan_feature_map
-    atom_to_mono_map = data.structure.atom_to_mono_idx_map
-
-    stereo_data_ok = stereo_data is not None and len(stereo_data) > 0
-    glycan_map_ok = glycan_feature_map is not None and len(glycan_feature_map) > 0
-    atom_map_ok = atom_to_mono_map is not None and len(atom_to_mono_map) > 0
-
-    if not all([stereo_data_ok, glycan_map_ok, atom_map_ok]):
-        # One or more required data maps for chirality processing is missing or empty.
-        return atom_chirality
-
-    mono_info_map = {
-        (asym_id, mono_idx): (
-            getattr(features, 'ccd_code', 'UNK').upper(),
-            getattr(features, 'anomeric_config', None)
-        )
-        for (asym_id, mono_idx), features in glycan_feature_map.items()
-    }
-
-    for asym_id, mono_indices_for_chain in atom_to_mono_map.items():
-        chain = next((c for c in data.structure.chains if c["asym_id"] == asym_id), None)
-        if chain is None: continue
-        
-        chain_start_atom_idx = chain["atom_idx"]
-        
-        for local_atom_idx, mono_idx in enumerate(mono_indices_for_chain):
-            if mono_idx == -1: continue
-
-            mono_key = (asym_id, mono_idx)
-            mono_info = mono_info_map.get(mono_key)
-            if not mono_info: continue
-            
-            mono_ccd_code, anomeric_config = mono_info
-            mono_stereo_rules = stereo_data.get(mono_ccd_code)
-            if not mono_stereo_rules: continue
-
-            global_atom_idx = chain_start_atom_idx + local_atom_idx
-            if global_atom_idx >= num_atoms_total: continue
-
-            atom = data.structure.atoms[global_atom_idx]
-            atom_name = decode_atom_name_from_offset_i1(atom['name'])
-
-            for rule in mono_stereo_rules:
-                if rule[0] == atom_name:
-                    chirality_val = 0
-                    # Rule for anomeric carbon: [atom_name, anomer_type, chirality]
-                    if len(rule) == 3:
-                        if anomeric_config and rule[1] == anomeric_config:
-                            chirality_str = rule[2]
-                            if chirality_str == 'R': chirality_val = 1
-                            elif chirality_str == 'S': chirality_val = 2
-                    # Rule for non-anomeric carbon: [atom_name, chirality]
-                    elif len(rule) == 2:
-                        chirality_str = rule[1]
-                        if chirality_str == 'R': chirality_val = 1
-                        elif chirality_str == 'S': chirality_val = 2
-                    
-                    if chirality_val > 0:
-                        atom_chirality[global_atom_idx] = chirality_val
-                        break
-    return atom_chirality
 
 def _get_default_mono_features(num_tokens: int, max_tokens: Optional[int], max_mono_chains: int) -> Dict[str, Tensor]:
     """ Helper to return dictionary of zero tensors for monosaccharide features. """
