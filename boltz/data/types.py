@@ -182,8 +182,13 @@ class Structure(NumpySerializable):
         atom_to_mono_idx_map = atom_to_mono_idx_map_raw.item() if atom_to_mono_idx_map_raw is not None and atom_to_mono_idx_map_raw.shape == () else None
         
         glycosylation_sites = data.get("glycosylation_sites", None)
-        if glycosylation_sites is not None and glycosylation_sites.shape == ():
-            glycosylation_sites = None # Handle empty array saved as scalar
+        
+        # FIX: Robustly handle 0-d arrays containing None (serialized from np.savez)
+        if glycosylation_sites is not None:
+             if glycosylation_sites.shape == () and glycosylation_sites.item() is None:
+                 glycosylation_sites = None
+             elif glycosylation_sites.size == 0:
+                 glycosylation_sites = None
 
         return cls(
             atoms=data["atoms"],
@@ -197,14 +202,11 @@ class Structure(NumpySerializable):
             glycan_feature_map=glycan_feature_map,
             atom_to_mono_idx_map=atom_to_mono_idx_map,
         )
-
+        
     def remove_invalid_chains(self) -> "Structure":  # noqa: PLR0915
         """
         Filters the structure to include only chains marked as True in self.mask.
-        This method rebuilds the atom, residue, and chain tables, re-indexing
-        them to be dense and contiguous. It also correctly updates all internal
-        references, including bonds, connections, and glycosylation_sites,
-        to reflect the new indices.
+        Re-indexes all structures and updates references.
         """
         entity_counter = {}
         atom_idx, res_idx, chain_idx = 0, 0, 0
@@ -222,6 +224,8 @@ class Structure(NumpySerializable):
             new_chain["atom_idx"], new_chain["res_idx"], new_chain["asym_id"], new_chain["sym_id"] = \
                 atom_idx, res_idx, chain_idx, entity_counter[entity_id]
             chains.append(new_chain)
+            
+            # Map Old Chain Index (i) -> New Chain Index (chain_idx)
             chain_map[i] = chain_idx
             chain_idx += 1
 
@@ -240,7 +244,7 @@ class Structure(NumpySerializable):
                 atom_map.update({k: atom_idx + k - start for k in range(start, end)})
                 atom_idx += res["atom_num"]
 
-        # Update glycosylation sites to use the new, re-mapped chain indices
+        # 1. Update glycosylation sites
         new_glycosylation_sites = []
         if self.glycosylation_sites is not None and self.glycosylation_sites.size > 0:
             for site in self.glycosylation_sites:
@@ -252,6 +256,24 @@ class Structure(NumpySerializable):
                     new_glycosylation_sites.append(new_site)
 
         updated_sites_arr = np.array(new_glycosylation_sites, dtype=GlycosylationSite) if new_glycosylation_sites else np.array([], dtype=GlycosylationSite)
+
+        # 2. Update Glycan Feature Map Keys
+        new_glycan_feature_map = {}
+        if self.glycan_feature_map is not None:
+            for (old_chain_idx, mono_idx), feature_obj in self.glycan_feature_map.items():
+                if old_chain_idx in chain_map:
+                    new_chain_idx = chain_map[old_chain_idx]
+                    # Update the key with the new chain index
+                    new_glycan_feature_map[(new_chain_idx, mono_idx)] = feature_obj
+
+        # 3. Update Atom-to-Mono-Idx Map Keys
+        new_atom_to_mono_idx_map = {}
+        if self.atom_to_mono_idx_map is not None:
+            for old_chain_idx, array_data in self.atom_to_mono_idx_map.items():
+                if old_chain_idx in chain_map:
+                    new_chain_idx = chain_map[old_chain_idx]
+                    # Update the key with the new chain index
+                    new_atom_to_mono_idx_map[new_chain_idx] = array_data
 
         # Rebuild final numpy arrays
         atoms = np.concatenate(atoms, dtype=Atom) if atoms else np.array([], dtype=Atom)
@@ -279,10 +301,9 @@ class Structure(NumpySerializable):
             interfaces=np.array([], dtype=Interface),
             mask=np.ones(len(chains), dtype=bool),
             glycosylation_sites=updated_sites_arr,
-            glycan_feature_map=self.glycan_feature_map,
-            atom_to_mono_idx_map=self.atom_to_mono_idx_map,
+            glycan_feature_map=new_glycan_feature_map,     # PASS UPDATED MAP
+            atom_to_mono_idx_map=new_atom_to_mono_idx_map, # PASS UPDATED MAP
         )
-
 
 ####################################################################################################
 # MSA
