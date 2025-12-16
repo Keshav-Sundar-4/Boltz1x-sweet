@@ -22,7 +22,6 @@ from boltz.data.types import (
     GlycosylationSite,
 )
 
-
 def load_input(
     record: Record,
     target_dir: Path,
@@ -34,26 +33,28 @@ def load_input(
 
     # Extract glycan maps if they exist
     glycan_feature_map_raw = structure_data.get('glycan_feature_map')
-    glycan_feature_map = (
-        glycan_feature_map_raw.item()
-        if glycan_feature_map_raw is not None
-        else None
-    )
+    glycan_feature_map = None
+    if glycan_feature_map_raw is not None and glycan_feature_map_raw.shape == ():
+        glycan_feature_map = glycan_feature_map_raw.item()
+
     atom_to_mono_idx_map_raw = structure_data.get('atom_to_mono_idx_map')
-    atom_to_mono_idx_map = (
-        atom_to_mono_idx_map_raw.item()
-        if atom_to_mono_idx_map_raw is not None
-        else None
-    )
+    atom_to_mono_idx_map = None
+    if atom_to_mono_idx_map_raw is not None and atom_to_mono_idx_map_raw.shape == ():
+        atom_to_mono_idx_map = atom_to_mono_idx_map_raw.item()
 
     # Handle glycosylation sites
     glyco_raw = structure_data.get('glycosylation_sites', None)
-    # No need to astype—it's already the correct dtype if present.
-    glycosylation_sites = (
-        glyco_raw
-        if (glyco_raw is not None and glyco_raw.size > 0)
-        else None
-    )
+    glycosylation_sites = None
+
+    if glyco_raw is not None:
+        # Check if it is a 0-d array containing None (result of np.savez with None)
+        if glyco_raw.shape == () and glyco_raw.item() is None:
+            glycosylation_sites = None
+        # Check if it's explicitly empty
+        elif glyco_raw.size == 0:
+            glycosylation_sites = None
+        else:
+            glycosylation_sites = glyco_raw
 
     # Reconstruct the Structure object
     structure = Structure(
@@ -69,8 +70,6 @@ def load_input(
         glycosylation_sites=glycosylation_sites,  
     )
 
-
-    # --- the rest is unchanged ---
     msas = {}
     for chain in record.chains:
         if (msa_id := chain.msa_id) != -1:
@@ -90,9 +89,6 @@ def load_input(
             pass
 
     return Input(structure, msas, residue_constraints=residue_constraints)
-
-
-
 
 def collate(data: list[dict[str, Tensor]]) -> dict[str, Tensor]:
     """Collate the data.
