@@ -212,12 +212,12 @@ def _get_glycosylation_linkage_mask(feats: Dict[str, Any], device: torch.device)
 class AnomericBondBias(nn.Module):
     """
     Apply a learned pairwise bias to glycosidic bonds based on the anomeric
-    configuration (alpha/beta/other) of the monosaccharide that contributes
-    the anomeric carbon.
-    
-    Updated to apply bias to:
-    1. Inter-residue glycosidic bonds (C1->Ox).
-    2. Intra-residue bonds where C1 connects to a terminal Oxygen (re-added OH).
+    configuration (alpha/beta/other).
+
+    UPDATED LOGIC:
+    This module now strictly applies bias ONLY to Intra-Glycan bonds.
+    It intentionally ignores Protein-Glycan bonds to avoid injecting noise
+    into these highly conserved, deterministic linkages.
     """
 
     def __init__(self, token_z: int, num_anomeric_types: int = 3) -> None:
@@ -257,9 +257,7 @@ class AnomericBondBias(nn.Module):
             z: Pairwise embeddings [B, L, L, token_z]
             feats: feature dictionary
         Returns:
-            z with anomeric biases added symmetrically to:
-            1. Inter-residue glycosidic bonds (Anomeric Carbon -> Next Residue).
-            2. Intra-residue anomeric bonds (Anomeric Carbon -> Heaviest Exocyclic Atom).
+            z with anomeric biases added ONLY to Sugar-Sugar bonds.
         """
         if z.dim() != 4:
             raise ValueError(f"z must be [B, L, L, Cz], got {z.shape}")
@@ -270,15 +268,34 @@ class AnomericBondBias(nn.Module):
         token_bonds = self._get_token_bonds(feats)  # [B, L, L]
         token_to_mono_idx = feats["token_to_mono_idx"]  # [B, L]
 
-        # 1. Topology & Element Masks
+        # ----------------------------------------------------------------------
+        # 1. Identify Entity Types (Sugar vs Protein/Other)
+        # ----------------------------------------------------------------------
+        # A token is part of a sugar if it has a valid mono_idx (!= -1).
+        # Conversely, Protein/Ligand/Water tokens have mono_idx == -1.
+        is_sugar_token = token_to_mono_idx != -1  # [B, L]
+        
+        # ----------------------------------------------------------------------
+        # 2. Identify Connectivity to Non-Sugar (Protein)
+        # ----------------------------------------------------------------------
+        # We need to know if any token is covalently bonded to a Protein.
+        # This is critical for O-linked glycans where the bond is C1 -> O1 -> Protein.
+        # We must NOT bias C1->O1 if O1 is attached to a Protein.
+        
+        is_non_sugar_token = ~is_sugar_token # [B, L]
+        
+        # Shape: [B, L] -> True if token i is bonded to ANY non-sugar token
+        # logic: (bond exists) AND (target is non-sugar)
+        connected_to_protein = (token_bonds & is_non_sugar_token.unsqueeze(1)).any(dim=2)
+
+        # ----------------------------------------------------------------------
+        # 3. Topology & Element Masks
+        # ----------------------------------------------------------------------
         mono_i = token_to_mono_idx.unsqueeze(2)  # [B, L, 1]
         mono_j = token_to_mono_idx.unsqueeze(1)  # [B, 1, L]
         
-        # Valid residue tokens
-        source_is_mono = mono_i != -1
-        
-        same_entity = (mono_i == mono_j) & source_is_mono
-        different_entity = (mono_i != mono_j) & source_is_mono & (mono_j != -1)
+        same_entity = (mono_i == mono_j) & is_sugar_token.unsqueeze(2)
+        different_entity = (mono_i != mono_j) & is_sugar_token.unsqueeze(2) & is_sugar_token.unsqueeze(1)
 
         # Get Element Types
         ref_elem_oh = feats["ref_element"].float()
@@ -289,7 +306,9 @@ class AnomericBondBias(nn.Module):
         OXYGEN_INDEX = 8
         is_oxygen = token_elem_idx == OXYGEN_INDEX  # [B, L]
 
-        # 2. Identify Specific Atom Names (C1 and C2)
+        # ----------------------------------------------------------------------
+        # 4. Identify Anomeric Carbon (C1 or C2) via Ring Topology
+        # ----------------------------------------------------------------------
         # Convert ref_atom_name_chars [B, A, 4, 64] -> Token names [B, L, 4, 64]
         ref_names = feats["ref_atom_name_chars"].float()
         token_names = torch.einsum("bta,banv->btnv", token_to_atom, ref_names)
@@ -302,58 +321,66 @@ class AnomericBondBias(nn.Module):
         is_named_c1 = (token_name_indices == c1_target).all(dim=-1) # [B, L]
         is_named_c2 = (token_name_indices == c2_target).all(dim=-1) # [B, L]
 
-        # 3. Determine the Anomeric Carbon using Ring Topology
         intra_bonds = token_bonds & same_entity
         intra_degree = intra_bonds.float().sum(dim=2)
         
         # Ring Oxygen: Oxygen with >= 2 bonds within residue
         is_ring_oxygen = is_oxygen & (intra_degree >= 2)
 
-        # Find which Carbon (C1 or C2) is bonded to the Ring Oxygen
+        # Find which Carbon is bonded to the Ring Oxygen
         connected_to_ring_o = (intra_bonds & is_ring_oxygen.unsqueeze(1)).any(dim=2)
         is_anomeric_carbon = (is_named_c1 | is_named_c2) & connected_to_ring_o
 
-        # 4. Determine Target Bond Partners
+        # ----------------------------------------------------------------------
+        # 5. Determine Target Bond Partners (Strictly Glycan-Only)
+        # ----------------------------------------------------------------------
         
-        # Partner A: Inter-residue (Glycosidic) bond
-        # Anomeric Carbon -> Any atom in a different residue
+        # --- Type A: Inter-residue Glycosidic Bond (Condensed Representation) ---
+        # C1 -> O4' (Next Sugar). 
+        # CRITICAL FIX: We strictly enforce that the target (different_entity) is a SUGAR.
+        # This implicitly excludes N-linked bonds (C1->Asn) because Asn is not a sugar.
         mask_inter = token_bonds & is_anomeric_carbon.unsqueeze(2) & different_entity
 
-        # Partner B: Intra-residue Heaviest Exocyclic Atom
-        # Strategy:
-        # 1. Look at all neighbors of the anomeric carbon within the same residue.
-        # 2. Filter for EXOCYCLIC atoms. We approximate this by looking for atoms with intra_degree == 1.
-        #    (Ring atoms like C2 or O5 will have intra_degree >= 2).
-        # 3. Among candidates, select the one with the highest atomic number (Mass).
-        
+        # --- Type B: Intra-residue Exocyclic Bond (Bridging Atom) ---
+        # C1 -> O1.
+        # CRITICAL FIX: We enforce that the neighbor (O1) is NOT connected to a protein.
+        # If O1 is connected to Ser/Thr, connected_to_protein[neighbor] is True.
+        # We mask these out to prevent biasing the O-linked interface.
+
         # [B, L_anom, L_neighbor]
         anomeric_neighbors = intra_bonds & is_anomeric_carbon.unsqueeze(2)
         
-        # Exocyclic Filter: Degree 1 within the residue (e.g. O1, OH, or exocyclic C in ketoses)
+        # Exocyclic Filter: Degree 1 within the residue
         is_exocyclic = intra_degree == 1
-        exocyclic_candidates = anomeric_neighbors & is_exocyclic.unsqueeze(1) 
+        
+        # FILTER: Neighbor must NOT be bonded to protein
+        is_pure_sugar_neighbor = is_exocyclic & (~connected_to_protein)
 
-        # Weight by Atomic Number (Oxygen=8 > Carbon=6 > Hydrogen=1)
+        exocyclic_candidates = anomeric_neighbors & is_pure_sugar_neighbor.unsqueeze(1) 
+
+        # Weight by Atomic Number (O > C > H) to find heaviest
         atomic_weights = token_elem_idx.float() # [B, L]
         candidate_weights = exocyclic_candidates * atomic_weights.unsqueeze(1) 
         
         # Find the max weight neighbor for each anomeric carbon
         max_vals, max_indices = candidate_weights.max(dim=2) # [B, L_anom]
         
-        # Reconstruct mask: (i, j) is True if i is Anomeric Carbon AND j is the Heaviest Exocyclic Neighbor
+        # Reconstruct mask
         col_indices = torch.arange(L, device=device).view(1, 1, L).expand(B, L, L)
         selected_neighbor_indices = max_indices.unsqueeze(2) 
         
         mask_intra = (
             is_anomeric_carbon.unsqueeze(2) & 
-            (max_vals.unsqueeze(2) > 0) & # Ensure we actually found a candidate (mass > 0)
+            (max_vals.unsqueeze(2) > 0) & 
             (col_indices == selected_neighbor_indices)
         )
 
         # Combine Masks
         final_bias_mask = mask_inter | mask_intra
 
-        # 5. Compute and Apply Bias
+        # ----------------------------------------------------------------------
+        # 6. Compute and Apply Bias
+        # ----------------------------------------------------------------------
         anomeric_config = feats["mono_anomeric"]  # [B, L, num_anomeric_types]
         pairwise_bias = self.pairwise_bias_embedding(anomeric_config)  # [B, L, Cz]
         pairwise_bias = pairwise_bias.unsqueeze(2)  # [B, L, 1, Cz]
@@ -369,8 +396,7 @@ class AnomericBondBias(nn.Module):
             z = z + sum(p.sum() * 0.0 for p in self.parameters())
 
         return z
-
-
+        
 #############################################################################################################
 #############################################################################################################
 #HELPERS
