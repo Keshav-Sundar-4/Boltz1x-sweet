@@ -725,6 +725,8 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
 
     # --- 1. Group items by entity type and sequence ---
     items_to_group = {}
+    glycan_unique_counter = 0  # FIX: Counter to force unique entities for glycans
+
     for item in schema["sequences"]:
         # Get entity type
         entity_type = next(iter(item.keys())).lower()
@@ -743,8 +745,11 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             else:
                 seq = f"ccd:{item[entity_type]['ccd']}"
         elif entity_type == "glycan":
-            # Group glycans by their IUPAC string
-            seq = f"iupac:{item[entity_type]['iupac']}"
+            # FIX: Append unique ID to key to force every glycan input to be a unique entity.
+            # This prevents the IHM writer from merging identical glycan chains into one entity,
+            # which causes "Duplicate entity" crashes if not handled perfectly.
+            seq = f"iupac:{item[entity_type]['iupac']}_{glycan_unique_counter}"
+            glycan_unique_counter += 1
             
         items_to_group.setdefault((entity_type, seq), []).append(item)
 
@@ -871,7 +876,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 raise ValueError(f"Invalid SMILES string: {seq}")
             mol = AllChem.AddHs(mol)
 
-            canonical_order = AllChem.CanonicalRankAtoms(mol)
+            canonical_order = AllChem.CanonicalRankAtoms(mol, breakTies=True)
             for atom, can_idx in zip(mol.GetAtoms(), canonical_order):
                 atom_name = atom.GetSymbol().upper() + str(can_idx + 1)
                 if len(atom_name) > 4:
@@ -897,6 +902,8 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         # --- D. Parse Glycan (IUPAC) ---
         elif entity_type == "glycan":
             iupac_str = items[0][entity_type]["iupac"]
+            # Store original IUPAC for reference, stripping the unique counter suffix if needed for display
+            # (though strictly entity_to_seq is just internal storage)
             entity_to_seq[entity_id] = iupac_str
             
             # Use the new parse_glycan function
@@ -1183,11 +1190,6 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             entity_id=int(chain["entity_id"]),
         ))
 
-    # Fix flat list of lists for pocket contacts if necessary
-    # The old code flattened `pocket_residues`. Ensure format matches `InferenceOptions` expectation.
-    # `pocket_residues` is List[List[Tuple[int, int]]]. `InferenceOptions` expects Optional[list[tuple[int, int]]] (flat).
-    # The old code's logic `pocket_residues[-1].extend` implies it keeps it flat per binder, but `InferenceOptions` usually takes a single flat list for the whole complex or one specific binder context.
-    # Given Boltz usually predicts one complex, we flatten.
     flat_pocket_residues = [item for sublist in pocket_residues for item in sublist] if pocket_residues else None
     
     options = InferenceOptions(binders=pocket_binders, pocket=flat_pocket_residues)
@@ -1215,7 +1217,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         sequences=entity_to_seq,
         residue_constraints=residue_constraints,
     )
-
+    
 def parse_standard_residue_with_bonds(
     name: str,
     ref_mol: Mol,
@@ -1394,38 +1396,45 @@ def tokenize_cyclodextrin(iupac: str) -> List[GlycanToken]:
 
 def compute_cyclodextrin_bonds(iupac: str, ccd: Mapping[str, Mol]) -> Tuple[List[ParsedResidue], List[Tuple[int, int, Tuple[str, int, int]]]]:
     """
-    Parses a cyclodextrin IUPAC string with anomer correction.
+    Parses a cyclodextrin IUPAC string.
+    Ensures the cycle is closed correctly from the last residue (Donor) to the flagged acceptor.
     """
     tokens = tokenize_cyclodextrin(iupac)
     residues: List[ParsedResidue] = []
     
+    # Track the original index of the acceptor (marked with '{')
+    # and the donor (the last residue in the sequence).
+    cyclic_acceptor_original_idx: Optional[int] = None
+    last_residue_token: Optional[GlycanToken] = None
+
     # 1. Create Residue Objects
     for token in tokens:
         if token.type == 'residue':
             idx = len(residues)
             token.residue_index = idx
+            last_residue_token = token
             
-            # Use the map from const.py to find the reference sugar
-            # E.g. token="BMA" -> lookup="MAN"
+            if token.is_cyclic_acceptor:
+                cyclic_acceptor_original_idx = idx
+            
             lookup_name = const.ANOMER_REF_MAP.get(token.value, token.value)
-            
-            # Ensure the lookup name exists in the CCD
             if lookup_name not in ccd:
-                 # Fallback to token value if lookup fails (e.g. map mismatch)
                  lookup_name = token.value
             
             if lookup_name not in ccd:
                 raise ValueError(f"CCD code '{lookup_name}' (mapped from '{token.value}') not found.")
             
-            # Parse using the Reference Molecule (lookup_name) but the Original Name (token.value)
-            # This ensures we get the 'MAN' conformer for 'BMA'
             res = parse_ccd_residue(token.value, ccd[lookup_name], res_idx=idx)
             residues.append(res)
 
-    # 2. Parse Linear Connections (Stack-based)
+    if cyclic_acceptor_original_idx is None:
+        raise ValueError("Cyclodextrin notation must contain a '{' marking the acceptor.")
+
+    # 2. Parse Linear Connections (Stack-based) - Same as branching logic
     stack: List[GlycanToken] = []
-    connections: List[Tuple[int, int, Tuple[str, int, int]]] = []
+    linear_connections: List[Tuple[int, int, Tuple[str, int, int]]] = []
     
+    # Filter only relevant tokens for the linear stack
     linear_tokens = [t for t in tokens if t.type in ('residue', 'open', 'close')]
 
     for token in reversed(linear_tokens):
@@ -1437,12 +1446,12 @@ def compute_cyclodextrin_bonds(iupac: str, ccd: Mapping[str, Mol]) -> Tuple[List
                     if stack and stack[-1].type == 'close':
                         stack.pop() # Remove ']'
                         target = stack[-1]
-                        connections.append((target.residue_index, token.residue_index, token.bond_spec))
+                        linear_connections.append((target.residue_index, token.residue_index, token.bond_spec))
                         stack.append(target) 
                         stack.append(token)
                     elif stack and stack[-1].type == 'residue':
                         target = stack[-1]
-                        connections.append((target.residue_index, token.residue_index, token.bond_spec))
+                        linear_connections.append((target.residue_index, token.residue_index, token.bond_spec))
                         stack.pop()
                         stack.append(token)
                 else:
@@ -1455,7 +1464,8 @@ def compute_cyclodextrin_bonds(iupac: str, ccd: Mapping[str, Mol]) -> Tuple[List
             if stack and stack[-1].type == 'close':
                 stack.pop()
 
-    # 3. Parse Cyclic Connection
+    # 3. Parse Cyclic Bond Spec
+    # Regex looks for "RES(a1-4)}" at the end of string
     cyclic_match = re.search(r'(\w+)\(([abAB])(\d+)-(\d+)\)\s*\}$', iupac)
     if not cyclic_match:
         raise ValueError(f"Could not parse cyclic bond specification from: {iupac}")
@@ -1465,19 +1475,22 @@ def compute_cyclodextrin_bonds(iupac: str, ccd: Mapping[str, Mol]) -> Tuple[List
     acceptor_num = int(cyclic_match.group(4))
     cyclic_bond_spec = (alpha_beta, donor_num, acceptor_num)
 
-    donor_token = next(t for t in tokens if t.type == 'residue' and t.residue_index == 0)
-    acceptor_token = next(t for t in tokens if t.is_cyclic_acceptor)
-    
-    connections.append((acceptor_token.residue_index, donor_token.residue_index, cyclic_bond_spec))
-
-    # 4. Reorder residues to be root-first (BFS)
+    # 4. Reorder residues (BFS based on LINEAR connections only)
+    # This prevents "0 roots" error because linear graph is a tree.
     if not residues:
         return [], []
 
-    root_idx = 0 
+    # Find linear root (usually the last residue in simple strings like AAA{BBB...})
+    child_indices = {c[1] for c in linear_connections}
+    root_candidates = [i for i in range(len(residues)) if i not in child_indices]
+    if len(root_candidates) != 1:
+        # In a perfect linear chain A->B->C, there is 1 root (C).
+        raise ValueError(f"Linear glycan parsing error: Found {len(root_candidates)} possible roots. Expected 1.")
+    
+    root_idx = root_candidates[0]
     
     adj = {i: [] for i in range(len(residues))}
-    for p, c, _ in connections:
+    for p, c, _ in linear_connections:
         adj[p].append(c)
 
     new_order_indices = []
@@ -1495,12 +1508,26 @@ def compute_cyclodextrin_bonds(iupac: str, ccd: Mapping[str, Mol]) -> Tuple[List
     reordered_residues = [residues[i] for i in new_order_indices]
     old_to_new_idx_map = {old_idx: new_idx for new_idx, old_idx in enumerate(new_order_indices)}
     
-    reordered_connections = [
+    # Map linear connections to new indices
+    final_connections = [
         (old_to_new_idx_map[p], old_to_new_idx_map[c], spec)
-        for p, c, spec in connections
+        for p, c, spec in linear_connections
     ]
 
-    return reordered_residues, reordered_connections
+    # 5. Add Cyclic Connection (mapped to new indices)
+    # Acceptor: Marked by '{'
+    # Donor: The last residue token found (highest original index)
+    
+    if last_residue_token is None:
+         raise ValueError("No residues found.")
+
+    cyclic_acceptor_new_idx = old_to_new_idx_map[cyclic_acceptor_original_idx]
+    cyclic_donor_new_idx = old_to_new_idx_map[last_residue_token.residue_index]
+
+    # Append: (Parent=Acceptor, Child=Donor)
+    final_connections.append((cyclic_acceptor_new_idx, cyclic_donor_new_idx, cyclic_bond_spec))
+
+    return reordered_residues, final_connections
 
 def tokenize_glycan(iupac: str) -> List[GlycanToken]:
     """
@@ -1796,6 +1823,7 @@ def parse_glycan(
             - If no config (e.g., "GAL"), O1/O2 is REMOVED.
     - Connections: Returns atom-level indices based on the filtered atom lists.
     - Correct Indexing: Ensures res.idx matches the topological list index.
+    - Linkage Support: Supports O, S, N, and C linked sugars.
     """
     
     root_config_spec = None
@@ -1814,10 +1842,7 @@ def parse_glycan(
     if not residues:
         return [], [], {}, np.array([])
 
-    # --- RE-INDEXING STEP (CRITICAL FIX) ---
-    # The residues are topologically ordered (Root=0), but their internal .idx
-    # property reflects the parsing order. We must re-index them to match the list order
-    # so that schema lookups (which use .idx) align with the topological logic.
+    # --- RE-INDEXING STEP ---
     residues_reindexed = []
     for new_idx, res in enumerate(residues):
         residues_reindexed.append(replace(res, idx=new_idx))
@@ -1852,13 +1877,35 @@ def parse_glycan(
         child_res = residues_modified[child_idx]
         _, donor_num, acceptor_num = bond_spec
         
-        # Define connecting atoms (Parent Oxygen -> Child Carbon)
-        acceptor_o_name = f"O{acceptor_num}"
+        # Define connecting atoms (Parent Atom -> Child Carbon)
+        # FIX: Support O, S, N, C linkages (e.g. O4, S4, N4)
         donor_c_name = f"C{donor_num}"
         
+        potential_acceptor_names = [
+            f"O{acceptor_num}", 
+            f"S{acceptor_num}", 
+            f"N{acceptor_num}", 
+            f"C{acceptor_num}"
+        ]
+        
+        p_atom_idx = -1
+        found_acceptor_name = "None"
+
+        # Try to find one of the valid acceptor atoms in the parent residue
+        for candidate in potential_acceptor_names:
+            try:
+                p_atom_idx = next(i for i, a in enumerate(parent_res.atoms) if a.name.upper() == candidate.upper())
+                found_acceptor_name = candidate
+                break
+            except StopIteration:
+                continue
+
         try:
-            # Find indices in the modified atom lists
-            p_atom_idx = next(i for i, a in enumerate(parent_res.atoms) if a.name.upper() == acceptor_o_name.upper())
+            # If we didn't find the parent atom, raise error
+            if p_atom_idx == -1:
+                 raise StopIteration("Parent linkage atom not found")
+
+            # Find child carbon index
             c_atom_idx = next(i for i, a in enumerate(child_res.atoms) if a.name.upper() == donor_c_name.upper())
             
             connection_indices.append((parent_idx, child_idx, p_atom_idx, c_atom_idx))
@@ -1868,7 +1915,7 @@ def parse_glycan(
             c_atoms = [a.name for a in child_res.atoms]
             raise ValueError(
                 f"Topology Error: Could not link {parent_res.name} (idx {parent_idx}) to {child_res.name} (idx {child_idx}).\n"
-                f"  Expected Parent Atom: {acceptor_o_name} (Available: {p_atoms})\n"
+                f"  Expected Parent Atom: One of {potential_acceptor_names} (Available: {p_atoms})\n"
                 f"  Expected Child Atom: {donor_c_name} (Available: {c_atoms})"
             )
 
