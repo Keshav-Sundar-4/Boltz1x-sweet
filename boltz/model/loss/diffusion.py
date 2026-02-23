@@ -241,3 +241,147 @@ def Linkage_Loss(
     # Handle potential NaN from division by zero if all weights are zero for valid items
     return final_loss if not torch.isnan(final_loss) else torch.tensor(0.0, device=device)
 
+def Glyco_AA_MSE_Loss(
+    feats: Dict[str, torch.Tensor],
+    pred_coords: torch.Tensor,
+    true_coords: torch.Tensor,
+    loss_weights: torch.Tensor,
+    multiplicity: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """
+    Calculates the Mean Squared Error (MSE) of the glycosylated amino acid and the 
+    attached glycan atom after performing an independent rigid alignment.
+    
+    This enforces the correct internal geometry of the entire amino acid and the 
+    linkage bond simultaneously, preventing backbone warping.
+    """
+    # Robustly determine original batch size (feats tensors are [B, N, ...])
+    B_orig = feats['atom_to_token'].shape[0]
+    
+    raw_sites_tensors = feats.get('raw_glycosylation_sites')
+    # Pre-fetch resolved mask: [B, N]
+    atom_resolved_mask_orig = feats["atom_resolved_mask"]
+
+    if raw_sites_tensors is None:
+        return None
+
+    total_mse_loss = torch.tensor(0.0, device=device)
+    site_count = torch.tensor(0.0, device=device)
+
+    # Iterate through each structure in the batch 'b'
+    for b in range(B_orig):
+        sites_tensor_b = raw_sites_tensors[b]
+        if sites_tensor_b is None or sites_tensor_b.numel() == 0:
+            continue
+
+        # Get atom mapping data for this batch item
+        # atom_to_token: [N, L] -> argmax -> [N]
+        atom_to_token = feats["atom_to_token"][b].argmax(-1)
+        token_asym_ids = feats["asym_id"][b]
+        token_res_indices = feats["residue_index"][b]
+        ref_name_chars = feats["ref_atom_name_chars"][b]
+
+        # Map atoms to Chain/Residue
+        atom_asym_ids = torch.gather(token_asym_ids, 0, atom_to_token)
+        atom_res_indices = torch.gather(token_res_indices, 0, atom_to_token)
+
+        for site_data_tensor in sites_tensor_b:
+            p_chain_id = site_data_tensor[0].item()
+            p_res_id = site_data_tensor[1].item()
+            
+            g_chain_id = site_data_tensor[6].item()
+            g_res_id = site_data_tensor[7].item()
+            g_name = _decode_int_to_str(site_data_tensor[8:12]).upper()
+
+            # 1. Get all atoms of the Glycosylated Amino Acid
+            p_res_mask = (atom_asym_ids == p_chain_id) & (atom_res_indices == p_res_id)
+            p_atoms_indices = torch.where(p_res_mask)[0]
+
+            if p_atoms_indices.numel() == 0:
+                continue
+
+            # 2. Get the singular covalently bonded Glycan Atom (e.g., C1)
+            g_res_mask = (atom_asym_ids == g_chain_id) & (atom_res_indices == g_res_id)
+            g_atoms_in_res = torch.where(g_res_mask)[0]
+            
+            g_atom_index = -1
+            for g_idx in g_atoms_in_res:
+                decoded_name = _decode_one_hot_to_str(ref_name_chars[g_idx]).upper()
+                if decoded_name == g_name:
+                    g_atom_index = g_idx.item()
+                    break
+            
+            if g_atom_index == -1:
+                continue
+
+            # 3. Combine Indices: [All AA Atoms] + [Linkage Glycan Atom]
+            g_idx_tensor = torch.tensor([g_atom_index], device=device, dtype=torch.long)
+            subset_indices = torch.cat([p_atoms_indices, g_idx_tensor])
+
+            # 4. Handle Multiplicity and Extraction
+            # The coordinate tensors have shape [B*M, N, 3]
+            # The rows corresponding to batch 'b' are [b*M, ..., (b+1)*M - 1]
+            batch_start = b * multiplicity
+            batch_end = (b + 1) * multiplicity
+
+            # Extract Coords: Shape [M, N_subset, 3]
+            # We slice the batch dim [batch_start:batch_end] and select specific atoms [subset_indices]
+            curr_pred = pred_coords[batch_start:batch_end][:, subset_indices, :]
+            curr_true = true_coords[batch_start:batch_end][:, subset_indices, :]
+            
+            # Extract Masks: Shape [N_subset] -> Expand to [M, N_subset]
+            curr_mask = atom_resolved_mask_orig[b, subset_indices]
+            curr_mask = curr_mask.unsqueeze(0).expand(multiplicity, -1)
+            
+            # Extract Sigma Weights: Shape [M]
+            curr_weights = loss_weights[batch_start:batch_end]
+            
+            # 5. Independent Rigid Alignment
+            # Align 'True' onto 'Pred' using the validity mask as weights
+            # Shape: [M, N_subset, 3]
+            aligned_true = weighted_rigid_align(
+                curr_true, 
+                curr_pred, 
+                curr_mask, 
+                curr_mask
+            )
+            
+            # 6. Calculate MSE on Aligned Subsets
+            diff = aligned_true - curr_pred
+            mse_per_atom = (diff ** 2).sum(dim=-1) # [M, N_subset]
+            
+            # Weighted average over atoms (ignoring unresolved atoms)
+            sum_sq_error = (mse_per_atom * curr_mask).sum(dim=-1) # [M]
+            num_valid_atoms = curr_mask.sum(dim=-1).clamp(min=1e-6) # [M]
+            
+            masked_mse_per_sample = sum_sq_error / num_valid_atoms
+            
+            # 7. Apply Sigma Weighting and Accumulate
+            # Average over the M samples for this site
+            weighted_site_loss = (masked_mse_per_sample * curr_weights).mean()
+            
+            total_mse_loss += weighted_site_loss
+            site_count += 1
+
+    if site_count == 0:
+        return None
+
+    return total_mse_loss / site_count
+
+def _decode_int_to_str(encoded_name: torch.Tensor) -> str:
+    """Decodes a tensor of 4 integers back into a string atom name."""
+    # Add 32 to convert back to ASCII character codes
+    char_codes = [c.item() + 32 for c in encoded_name]
+    # Convert codes to characters and join, stripping trailing whitespace
+    return "".join([chr(c) for c in char_codes]).strip()
+
+def _decode_one_hot_to_str(one_hot_encoded_name: torch.Tensor) -> str:
+    """Decodes a one-hot encoded name from ref_atom_name_chars."""
+    # Find the integer index for each of the 4 character positions
+    integer_indices = torch.argmax(one_hot_encoded_name, dim=-1)
+    # Add 32 to convert back to ASCII character codes
+    char_codes = [idx.item() + 32 for idx in integer_indices]
+    # Filter out null characters (code 32) and join
+    return "".join([chr(c) for c in char_codes if c > 32]).strip()
+
