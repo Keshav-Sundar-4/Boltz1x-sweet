@@ -16,6 +16,7 @@ from boltz.model.loss.diffusion import (
     smooth_lddt_loss,
     weighted_rigid_align,
     Linkage_Loss,
+    Glyco_AA_MSE_Loss,
 )
 from boltz.model.modules.encoders import (
     AtomAttentionDecoder,
@@ -743,7 +744,6 @@ class AtomDiffusion(Module):
             aligned_true_atom_coords=atom_coords,
         )
 
-
     def compute_loss(
         self,
         feats,
@@ -803,13 +803,23 @@ class AtomDiffusion(Module):
                 denoised_atom_coords,
                 feats["coords"],
                 ((atom_type == const.chain_type_ids["DNA"]).float()
-                 + (atom_type == const.chain_type_ids["RNA"]).float()),
+                    + (atom_type == const.chain_type_ids["RNA"]).float()),
                 coords_mask=feats["atom_resolved_mask"],
                 multiplicity=multiplicity,
             )
 
-        # --- Glycosidic Linkage Distance Loss ---
+        # --- Glycosidic Linkage Distance Loss (Inter-residue bond length) ---
         linkage_loss = Linkage_Loss(
+            feats=feats,
+            pred_coords=denoised_atom_coords,
+            true_coords=feats["coords"],
+            loss_weights=loss_weights,
+            multiplicity=multiplicity,
+            device=denoised_atom_coords.device,
+        )
+
+        # --- Glycosylated Amino Acid Geometric MSE (Corrects Warping) ---
+        glyco_aa_mse_loss = Glyco_AA_MSE_Loss(
             feats=feats,
             pred_coords=denoised_atom_coords,
             true_coords=feats["coords"],
@@ -820,25 +830,29 @@ class AtomDiffusion(Module):
 
         # 1. Substitute `None` with a zero tensor for the `total_loss` calculation to fix DDP.
         linkage_loss_for_total = linkage_loss if linkage_loss is not None else self.zero
+        glyco_aa_loss_for_total = glyco_aa_mse_loss if glyco_aa_mse_loss is not None else self.zero
 
-        # 2. Assemble the total loss (Mono MSE removed).
-        total_loss = mse_loss + lddt_loss + linkage_loss_for_total
+        # 2. Assemble the total loss.
+        total_loss = mse_loss + lddt_loss + linkage_loss_for_total + glyco_aa_loss_for_total
 
-        # 3. Keep the original `linkage_loss` (which can be `None`) in the breakdown dictionary.
+        # 3. Keep the original variables (which can be `None`) in the breakdown dictionary.
         loss_breakdown = dict(
             mse_loss=mse_loss,
             smooth_lddt_loss=lddt_loss,
-            linkage_loss=linkage_loss, # This can be None
+            linkage_loss=linkage_loss, 
+            glyco_aa_mse_loss=glyco_aa_mse_loss, 
         )
 
-        # 4. Modify the print statement to handle the `None` case.
+        # 4. Modify the print statement to handle the `None` case securely with 'N/A'
         linkage_loss_for_print = f"{linkage_loss.item():<12.6f}" if linkage_loss is not None else "N/A"
+        glyco_aa_loss_for_print = f"{glyco_aa_mse_loss.item():<12.6f}" if glyco_aa_mse_loss is not None else "N/A"
 
         print(
             f"Loss Breakdown: \n"
-            f"SmoothLDDT: {lddt_loss.item():<12.6f}\n"
-            f"MSE:        {mse_loss.item():<12.6f}\n"
-            f"Linkage Loss:    {linkage_loss_for_print}\n\n",
+            f"SmoothLDDT:       {lddt_loss.item():<12.6f}\n"
+            f"MSE:              {mse_loss.item():<12.6f}\n"
+            f"Linkage Loss:     {linkage_loss_for_print}\n"
+            f"Glyco AA MSE:     {glyco_aa_loss_for_print}\n\n",
             flush=True,
         )
 
