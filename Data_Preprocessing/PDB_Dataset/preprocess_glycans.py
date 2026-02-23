@@ -534,6 +534,29 @@ def get_atom_mass(element: str) -> float:
     table = {'O': 16.0, 'N': 14.0, 'C': 12.0, 'S': 32.0, 'P': 31.0, 'H': 1.0}
     return table.get(element.upper(), 0.0)
 
+def calculate_angle(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> float:
+    """
+    Calculates the angle (in degrees) between three points p1-p2-p3, 
+    where p2 is the center vertex.
+    """
+    v1 = p1 - p2
+    v2 = p3 - p2
+
+    norm_v1 = np.linalg.norm(v1)
+    norm_v2 = np.linalg.norm(v2)
+
+    if norm_v1 < 1e-6 or norm_v2 < 1e-6:
+        return 0.0
+
+    cosine_angle = np.dot(v1, v2) / (norm_v1 * norm_v2)
+    
+    # Clip to handle floating point errors slightly outside domain [-1, 1]
+    cosine_angle = np.clip(cosine_angle, -1.0, 1.0)
+    
+    angle = np.arccos(cosine_angle)
+    return np.degrees(angle)
+
+
 def calculate_dihedral(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray, p4: np.ndarray) -> float:
     """
     Calculate the dihedral angle (in degrees) defined by 4 points.
@@ -828,15 +851,27 @@ def parse_seqres(filepath: Path) -> Dict[str, List[str]]:
 def parse_glycoprotein_pdb(
     pdb_file: PDBFile,
     ccd: Mapping[str, Mol]
-) -> Tuple[Optional[ParsedGlycoproteinData], Optional[Dict], Optional[Dict], Optional[List], Optional[List]]:
+) -> Tuple[Optional[ParsedGlycoproteinData], Optional[Dict], Optional[Dict], Optional[List], Optional[List], Dict[str, int]]:
     """
     (MODIFIED) Parses a PDB file.
     1. Rechains glycans.
-    2. Detects connections (using all atoms).
-    3. Removes Anomeric Oxygens (O1/O2) ONLY for internal/donor residues.
-    4. Parses residues with strict missing atom validation.
+    2. Detects connections.
+    3. NEW: Filters sites based on Anomeric Config (Bio-logic) AND Geometry (ASN-logic).
+    4. Removes Anomeric Oxygens.
+    
+    Returns:
+        (ParsedData, Error, SiteStats, AnomalousSites, NoRingErrors, RemovalCountsDict)
     """
     pdb_id = pdb_file.id
+    
+    # Initialize removal counters
+    removal_counts = {
+        'bad_geom_asn': 0,
+        'alpha_asn': 0, 'other_asn': 0,
+        'beta_ser': 0, 'other_ser': 0,
+        'beta_thr': 0, 'other_thr': 0
+    }
+
     try:
         name_map = {
             "A2G": {"C2N": "C7", "CME": "C8", "O2N": "O7"}, "NAG": {"C2N": "C7", "CME": "C8", "O2N": "O7"},
@@ -851,21 +886,99 @@ def parse_glycoprotein_pdb(
             raw_atom_lines = [line for line in f if line.startswith(('ATOM', 'HETATM'))]
         
         if not raw_atom_lines:
-            return None, {"type": "Parsing Error", "pdb_id": pdb_id, "message": "File contains no ATOM/HETATM records."}, {}, [], []
+            return None, {"type": "Parsing Error", "pdb_id": pdb_id, "message": "File contains no ATOM/HETATM records."}, {}, [], [], removal_counts
             
         rechained_atom_lines = _rechain_glycan_components(raw_atom_lines)
         atoms_by_residue, chain_types = parse_pdb_atoms_by_residue(rechained_atom_lines)
-        
         seqres_data = parse_seqres(pdb_file.path)
 
-        # --- STEP 1: Detect Connections FIRST ---
-        # We need to know connections to determine which residues are donors (children)
+        # --- STEP 1: Detect Connections ---
         glycosidic_conns, glycosylation_sites, site_stats, anomalous_sites, no_ring_errors = detect_all_connections(
             atoms_by_residue, pdb_id=pdb_id
         )
+
+        # --- STEP 1.5: Apply Biochemical and Geometric Filters ---
+        valid_glycosylation_sites = []
+        invalid_glycan_chain_ids: Set[str] = set()
+
+        for site in glycosylation_sites:
+            prot_key = (site.protein_chain_id, site.protein_res_id)
+            glycan_key = (site.glycan_chain_id, site.glycan_res_id)
+            
+            prot_atoms = atoms_by_residue.get(prot_key, [])
+            glycan_atoms = atoms_by_residue.get(glycan_key, [])
+            
+            if not prot_atoms or not glycan_atoms:
+                valid_glycosylation_sites.append(site)
+                continue
+
+            res_name = prot_atoms[0]['residue_name']
+            config = site.anomeric # 'a', 'b', or 'error...'
+
+            # --- A. Biochemical Filters (Anomeric Config) ---
+            if res_name == 'ASN':
+                if config == 'a':
+                    removal_counts['alpha_asn'] += 1
+                    invalid_glycan_chain_ids.add(site.glycan_chain_id)
+                    continue
+                elif config != 'b': # "other" (error, missing ring, etc, or None)
+                    removal_counts['other_asn'] += 1
+                    invalid_glycan_chain_ids.add(site.glycan_chain_id)
+                    continue
+            
+            elif res_name == 'SER':
+                if config == 'b':
+                    removal_counts['beta_ser'] += 1
+                    invalid_glycan_chain_ids.add(site.glycan_chain_id)
+                    continue
+                elif config != 'a': # "other"
+                    removal_counts['other_ser'] += 1
+                    invalid_glycan_chain_ids.add(site.glycan_chain_id)
+                    continue
+
+            elif res_name == 'THR':
+                if config == 'b':
+                    removal_counts['beta_thr'] += 1
+                    invalid_glycan_chain_ids.add(site.glycan_chain_id)
+                    continue
+                elif config != 'a': # "other"
+                    removal_counts['other_thr'] += 1
+                    invalid_glycan_chain_ids.add(site.glycan_chain_id)
+                    continue
+
+            # --- B. Geometric Filter (ASN Only) ---
+            if res_name == "ASN":
+                atom_map_prot = {a['atom_name'].upper(): np.array([a['x'], a['y'], a['z']]) for a in prot_atoms}
+                atom_map_glyc = {a['atom_name'].upper(): np.array([a['x'], a['y'], a['z']]) for a in glycan_atoms}
+                
+                od1 = atom_map_prot.get("OD1")
+                cg = atom_map_prot.get("CG")
+                nd2 = atom_map_prot.get("ND2")
+                # site.glycan_atom_name should be C1 or C2
+                c_glycan = atom_map_glyc.get(site.glycan_atom_name.upper()) 
+                
+                if od1 is not None and cg is not None and nd2 is not None and c_glycan is not None:
+                    # 1. Angle [CG, ND2, C_glycan]
+                    angle_val = calculate_angle(cg, nd2, c_glycan)
+                    
+                    # 2. Dihedral [OD1, CG, ND2, C_glycan]
+                    dihedral_val = calculate_dihedral(od1, cg, nd2, c_glycan)
+                    
+                    # 3. Check Thresholds
+                    angle_pass = 110.0 < angle_val < 130.0
+                    dihedral_pass = -20.0 < dihedral_val < 20.0
+                    
+                    if not angle_pass or not dihedral_pass:
+                        removal_counts['bad_geom_asn'] += 1
+                        invalid_glycan_chain_ids.add(site.glycan_chain_id)
+                        continue 
+            
+            # If we reached here, the site is valid
+            valid_glycosylation_sites.append(site)
         
-        # --- STEP 2: Remove Anomeric Oxygens Conditionally ---
-        # Pass the connections so we know which are children (delete O) and which are roots (keep O)
+        glycosylation_sites = valid_glycosylation_sites
+
+        # --- STEP 2: Remove Anomeric Oxygens ---
         preprocess_remove_anomeric_oxygen(atoms_by_residue, glycosidic_conns, glycosylation_sites)
 
         glycosylated_protein_res_keys = {
@@ -877,20 +990,13 @@ def parse_glycoprotein_pdb(
         
         chains_to_residues: Dict[str, List[ParsedResidue]] = defaultdict(list)
         
-        # Track chains (glycan trees) that fail validation
-        invalid_glycan_chain_ids: Set[str] = set()
-
         for (chain_id, res_num_pdb), pdb_atoms in atoms_by_residue.items():
-            # If this chain is already marked invalid, skip remaining residues
             if chain_id in invalid_glycan_chain_ids:
                 continue
 
             if not pdb_atoms: continue
             res_name = pdb_atoms[0]['residue_name']
-            
-            # Temporary index, corrected later
             temp_res_idx = len(chains_to_residues[chain_id])
-            
             parsed_res = None
             
             try:
@@ -899,31 +1005,23 @@ def parse_glycoprotein_pdb(
                     res_key = (chain_id, res_num_pdb)
                     if res_key in glycosylated_protein_res_keys:
                         parsed_res = replace(parsed_res, is_standard=False)
-
                 elif res_name in ccd: 
-                    # This might raise ValueError if missing atoms >= 2
                     parsed_res = parse_glycan_residue(res_name, res_num_pdb, temp_res_idx, pdb_atoms, ccd, name_map, inverse_name_map)
-            
             except ValueError as ve:
-                # Handle specific missing atom error localized to this chain
                 if "CRITICAL_MISSING_ATOMS" in str(ve):
                     print(f"[{pdb_id}] Dropping Glycan Chain '{chain_id}' due to malformed residue {res_name} (ID: {res_num_pdb}): {ve}")
                     invalid_glycan_chain_ids.add(chain_id)
-                    # Remove any residues collected for this chain so far
                     if chain_id in chains_to_residues:
                         del chains_to_residues[chain_id]
                     parsed_res = None
                     continue
                 else:
-                    # Propagate other unexpected errors
                     raise ve
 
             if parsed_res:
                 chains_to_residues[chain_id].append(parsed_res)
         
-        # Process missing protein residues (SEQRES)
         for chain_id, mol_type in chain_types.items():
-            # If a protein chain was somehow marked invalid (unlikely via glycan logic), skip it
             if chain_id in invalid_glycan_chain_ids: continue 
 
             if mol_type == "PROTEIN" and chain_id in seqres_data:
@@ -936,7 +1034,6 @@ def parse_glycoprotein_pdb(
                         if parsed_res:
                             chains_to_residues[chain_id].append(parsed_res)
 
-        # Filter connections to remove invalid chains
         filtered_glycosidic_conns = [
             c for c in glycosidic_conns 
             if c.parent_chain_id not in invalid_glycan_chain_ids 
@@ -946,14 +1043,12 @@ def parse_glycoprotein_pdb(
         filtered_glycosylation_sites = [
             s for s in glycosylation_sites
             if s.glycan_chain_id not in invalid_glycan_chain_ids
-            # Note: We assume protein chains didn't trigger CRITICAL_MISSING_ATOMS
         ]
 
         parsed_chains: Dict[str, ParsedChain] = {}
         for chain_id, res_list in chains_to_residues.items():
             if not res_list: continue
             res_list.sort(key=lambda r: r.orig_idx)
-            
             for i, res in enumerate(res_list):
                 res_list[i] = replace(res, idx=i)
             
@@ -969,11 +1064,11 @@ def parse_glycoprotein_pdb(
             pdb_id=pdb_id, chains=parsed_chains,
             glycosidic_connections=filtered_glycosidic_conns,
             glycosylation_sites=filtered_glycosylation_sites
-        ), None, site_stats, anomalous_sites, no_ring_errors
+        ), None, site_stats, anomalous_sites, no_ring_errors, removal_counts
 
     except Exception as e:
         error_message = f"{type(e).__name__}: {e}"
-        return None, {"type": "Processing Exception", "pdb_id": pdb_id, "message": error_message, "traceback": traceback.format_exc()}, {}, [], []
+        return None, {"type": "Processing Exception", "pdb_id": pdb_id, "message": error_message, "traceback": traceback.format_exc()}, {}, [], [], removal_counts
 
 def _parse_unresolved_ccd_residue(
     name: str,
@@ -1672,21 +1767,20 @@ def finalize(outdir: Path) -> None:
         json.dump(final_manifest_entries, f, indent=2)
     print("Manifest saved successfully.")
 
-# --- The main `process_pdb_file` function must be rewritten to use the new logic ---
 def process_pdb_file(
     task: Tuple[PDBFile, int], 
     outdir: Path
-) -> Tuple[bool, Optional[Dict], bool, Optional[Dict], Optional[List], Optional[List]]:
+) -> Tuple[bool, Optional[Dict], bool, Optional[Dict], Optional[List], Optional[List], Dict[str, int]]:
     """
-    (REVISED TO RETURN ERRORS) Processes a single PDB file and returns a
-    6-element tuple including stats, anomalies, and "no ring" errors.
+    (REVISED) Processes a single PDB file and returns the removal stats dictionary.
     """
     pdb_file, cluster_id = task
     
     global worker_ccd_data
     if worker_ccd_data is None:
         error_info = {"type": "Worker Error", "pdb_id": "N/A", "message": "Worker CCD data not loaded."}
-        return False, error_info, False, {}, [], []
+        # Return empty dict for counters
+        return False, error_info, False, {}, [], [], {}
 
     pdb_id = pdb_file.id
     struct_path = outdir / "structures" / f"{pdb_id}.npz"
@@ -1696,13 +1790,13 @@ def process_pdb_file(
     record_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        # Unpack the new no_ring_errors list
-        parsed_data, error, site_stats, anomalous_sites, no_ring_errors = parse_glycoprotein_pdb(pdb_file, worker_ccd_data)
+        # Unpack the tuple including removal_counts dict
+        parsed_data, error, site_stats, anomalous_sites, no_ring_errors, removal_counts = parse_glycoprotein_pdb(pdb_file, worker_ccd_data)
         
         if error:
-            return False, error, False, {}, [], []
+            return False, error, False, {}, [], [], removal_counts
         if not parsed_data:
-            return False, {"type": "Unknown Parse Error", "pdb_id": pdb_id, "message": "Parsing returned no data."}, False, {}, [], []
+            return False, {"type": "Unknown Parse Error", "pdb_id": pdb_id, "message": "Parsing returned no data."}, False, {}, [], [], removal_counts
 
         npz_data, record = assemble_glycoprotein_structure(parsed_data, cluster_id)
         
@@ -1716,8 +1810,7 @@ def process_pdb_file(
         with open(record_path, 'w') as f:
             json.dump(asdict(record), f, indent=4, cls=NumpyJSONEncoder)
 
-        # Return the no_ring_errors list
-        return True, None, has_site, site_stats, anomalous_sites, no_ring_errors
+        return True, None, has_site, site_stats, anomalous_sites, no_ring_errors, removal_counts
 
     except Exception as e:
         tb_str = traceback.format_exc()
@@ -1734,13 +1827,11 @@ def process_pdb_file(
             "pdb_id": pdb_id,
             "message": f"{error_type}: {error_msg}",
             "traceback": tb_str
-        }, False, {}, [], []
+        }, False, {}, [], [], {}
 
-# --- Main Execution ---
 def main(args):
     """
-    (MODIFIED) Main loop that treats every input file as a unique cluster.
-    Clustering logic has been removed.
+    (MODIFIED) Main loop. Aggregates and prints all filtration stats.
     """
     script_overall_start_time = time.time()
     args.outdir.mkdir(parents=True, exist_ok=True)
@@ -1756,27 +1847,20 @@ def main(args):
         print("No PDB files found. Exiting.")
         return 0
     
-    # Create PDBFile objects
     initial_tasks = [PDBFile(id=p.stem, path=p, cluster_num=0, frame_num=0) for p in all_pdb_paths]
     print(f"Found {len(initial_tasks)} PDB files to process.")
 
     use_parallel = args.num_processes > 1 and len(initial_tasks) > 1
     ccd_path_str = str(args.ccd_path.resolve())
     
-    # --- CHANGE: Clustering Removed ---
-    # We assign a unique cluster ID (index 'i') to every single file.
-    # We skip the sequence generation pass entirely.
-    
     print("\n--- Processing files (No Clustering / 1 Cluster per File) ---")
     
-    # The task format is (PDBFile_Object, Cluster_ID)
     final_processing_tasks = [(task, i) for i, task in enumerate(initial_tasks)]
 
     results = []
     if final_processing_tasks:
         if use_parallel:
             process_func = partial(process_pdb_file, outdir=args.outdir)
-            # Initialize workers with CCD data
             with multiprocessing.Pool(args.num_processes, initializer=worker_init, initargs=(ccd_path_str,)) as pool:
                 results = list(tqdm(pool.imap_unordered(process_func, final_processing_tasks), total=len(final_processing_tasks), desc="Processing"))
         else:
@@ -1788,9 +1872,18 @@ def main(args):
     global_site_stats = defaultdict(lambda: defaultdict(int))
     global_anomalous_sites = []
     global_no_ring_errors = []
+    
+    # Global accumulator for removals
+    global_removal_counts = defaultdict(int)
 
-    # Unpack the 6-element tuple from results
-    for success, error_info, has_site, site_stats_for_file, anomalous_sites_for_file, no_ring_errors_for_file in results:
+    # Unpack the 7-element tuple from results
+    for success, error_info, has_site, site_stats_for_file, anomalous_sites_for_file, no_ring_errors_for_file, removal_counts_file in results:
+        # We accumulate removal stats even if the file failed later (e.g. assembly error),
+        # but usually we only get them if parse_glycoprotein_pdb returns.
+        if removal_counts_file:
+            for k, v in removal_counts_file.items():
+                global_removal_counts[k] += v
+
         if success:
             success_count += 1
             if site_stats_for_file:
@@ -1823,15 +1916,17 @@ def main(args):
             print(summary_line)
     print("----------------------------------------------------------------")
 
-    print("\n\n--- Summary of Biochemically Anomalous Glycosylation Sites ---")
+    print("\n\n--- Summary of Biochemically Anomalous Glycosylation Sites (Survivors) ---")
     if not global_anomalous_sites:
-        print("No anomalous linkages (alpha-ASN, beta-THR, beta-SER) were found.")
+        print("No anomalous linkages (alpha-ASN, beta-THR, beta-SER) were found remaining in the dataset.")
     else:
+        # Note: These numbers should ideally be zero if the new filter works perfectly,
+        # unless 'anomalous_sites' in 'detect_connections' flags things differently than the filter logic.
         alpha_asn_examples = [s for s in global_anomalous_sites if s[1] == 'ASN']
         beta_ser_examples = [s for s in global_anomalous_sites if s[1] == 'SER']
         beta_thr_examples = [s for s in global_anomalous_sites if s[1] == 'THR']
 
-        print(f"Found {len(alpha_asn_examples)} alpha-ASN, {len(beta_ser_examples)} beta-SER, and {len(beta_thr_examples)} beta-THR linkages.")
+        print(f"Found {len(alpha_asn_examples)} alpha-ASN, {len(beta_ser_examples)} beta-SER, and {len(beta_thr_examples)} beta-THR linkages remaining.")
         
         if alpha_asn_examples:
             print("\nDisplaying up to 3 examples of alpha-ASN linkages:")
@@ -1849,6 +1944,18 @@ def main(args):
             print(f"  - PDB ID: {pdb_id}, Glycosylated Residue: {res_name}{res_num}")
         if len(global_no_ring_errors) > 5:
              print(f"... and {len(global_no_ring_errors) - 5} more.")
+    print("----------------------------------------------------------------")
+    
+    # --- FLUSHED PRINT STATEMENT FOR REMOVED GLYCANS ---
+    print("\n--- Summary of Removed Glycans (Filtering) ---")
+    print(f"Total glycans removed due to 'bad-ASN' geometry: {global_removal_counts['bad_geom_asn']}")
+    print(f"Total glycans removed due to 'alpha-ASN' config: {global_removal_counts['alpha_asn']}")
+    print(f"Total glycans removed due to 'other-ASN' config: {global_removal_counts['other_asn']}")
+    print(f"Total glycans removed due to 'beta-SER' config:  {global_removal_counts['beta_ser']}")
+    print(f"Total glycans removed due to 'other-SER' config: {global_removal_counts['other_ser']}")
+    print(f"Total glycans removed due to 'beta-THR' config:  {global_removal_counts['beta_thr']}")
+    print(f"Total glycans removed due to 'other-THR' config: {global_removal_counts['other_thr']}")
+    sys.stdout.flush()
     print("----------------------------------------------------------------")
 
 
