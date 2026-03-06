@@ -16,8 +16,8 @@ This script uses hardcoded directories to save the retrieved PDB IDs.
 
 **Lines to Change:**
 Before running, open the file and modify the following lines to match your local directory structure:
-* **Line 17:** `OUT_DIR = Path("Boltz_Data_Files")` -> Change `"Boltz_Data_Files"` to your desired output folder path. 
-* *Note: `OUT_FILE` (Line 18) will automatically be created inside whatever you set `OUT_DIR` to.*
+* **Line 20:** `OUT_DIR = Path("Boltz_Data_Files")` -> Change `"Boltz_Data_Files"` to your desired output folder path. 
+* *Note: `OUT_FILE` (Line 21) will automatically be created inside whatever you set `OUT_DIR` to.*
 
 ---
 
@@ -29,8 +29,8 @@ This script uses hardcoded directories for both its input list and its output de
 
 **Lines to Change:**
 Update the configuration section to point to your specific paths:
-* **Line 22:** `PDB_ID_FILE = Path("Boltz_Data_Files/pdb_ids_with_glycans.txt")` -> Change this to the path where your input text file of PDB IDs is located.
-* **Line 23:** `OUTPUT_DIR = Path("PDB_Downloads")` -> Change this to the directory where you want the `.pdb` files to be downloaded.
+* **Line 23:** `PDB_ID_FILE = Path("Boltz_Data_Files/pdb_ids_with_glycans.txt")` -> Change this to the path where your input text file of PDB IDs is located.
+* **Line 24:** `OUTPUT_DIR = Path("PDB_Downloads")` -> Change this to the directory where you want the `.pdb` files to be downloaded.
 
 ---
 
@@ -42,8 +42,8 @@ This script processes data using hardcoded absolute paths.
 
 **Lines to Change:**
 Locate the `--- HARDCODED CONFIGURATION ---` section and update these paths:
-* **Line 43:** `INPUT_FOLDER = '/work/keshavsundar/.../PDB_Raw_Dataset'` -> Change to the path of your raw PDB files.
-* **Line 44:** `OUTPUT_FOLDER = '/work/keshavsundar/.../Phase1_Raw_Dataset'` -> Change to the path where you want the cleaned files saved.
+* **Line 50:** `INPUT_FOLDER = '/work/keshavsundar/.../PDB_Raw_Dataset'` -> Change to the path of your raw PDB files.
+* **Line 51:** `OUTPUT_FOLDER = '/work/keshavsundar/.../Phase1_Raw_Dataset'` -> Change to the path where you want the cleaned files saved.
 
 ---
 
@@ -67,9 +67,9 @@ This script uses hardcoded paths for its input, output, and a necessary `.pkl` f
 
 **Lines to Change:**
 Update the `--- CONFIGURATION ---` block to match your system:
-* **Line 16:** `TARGET_FOLDER = Path("...")` -> Change to the folder containing the input PDBs you want to clean.
-* **Line 17:** `OUTPUT_FOLDER = Path("...")` -> Change to the destination folder for the cleaned data.
-* **Line 18:** `CCD_FILE = Path("...")` -> Change to the specific file path pointing to your `ccd.pkl` weights file.
+* **Line 21:** `TARGET_FOLDER = Path("...")` -> Change to the folder containing the input PDBs you want to clean.
+* **Line 22:** `OUTPUT_FOLDER = Path("...")` -> Change to the destination folder for the cleaned data.
+* **Line 23:** `CCD_FILE = Path("...")` -> Change to the specific file path pointing to your `ccd.pkl` weights file.
 
 ---
 
@@ -95,8 +95,8 @@ This script uses hardcoded paths to locate the `.npz` files and determine where 
 
 **Lines to Change:**
 Update the `=== CONFIGURATION ===` block:
-* **Line 21:** `NPZ_DIR = '...'` -> Change to the directory containing the `.npz` structure files generated in the previous step.
-* **Line 24:** `OUTPUT_FILE = '...'` -> Change to the exact file path (including the `.txt` extension) where you want the validation IDs to be written.
+* **Line 29:** `NPZ_DIR = '...'` -> Change to the directory containing the `.npz` structure files generated in the previous step.
+* **Line 32:** `OUTPUT_FILE = '...'` -> Change to the exact file path (including the `.txt` extension) where you want the validation IDs to be written.
 
 ---
 
