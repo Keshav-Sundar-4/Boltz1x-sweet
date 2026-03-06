@@ -1,5 +1,13 @@
 # Processing Procedure:
 1. Use pdb_api_call.py to obtain a folder of PDB files
+2. Use pdb_api.py call on the text file created via step one to generate the PDB glycan dataset
+3.
+      a) Use the phase1_cleaner.py script on the dataset obtained in step 2
+      b) Generate a dataset of free-floating glycans via free_glycan_data.py. (Note that if you use the PDB glycan dataset you will get a small number of free-floating glycans. It is suggested you also            generate an MD dataset as well.)
+      c) Use lectinz_clean.py and point it at the free-floating dataset that was created in Step 3b
+      d) Combine the folders generated in steps 3a-c 
+4. Run preprocess_glycans.py on the folder generated in step 3d
+5. Run validation_dataset_creation.py on the folder generated in step 4
 
 
 # Processing Instructions:
