@@ -1,7 +1,8 @@
-## Processing Procedure:
+# Processing Procedure:
 1. Use pdb_api_call.py to obtain a folder of PDB files
 
-## Processing Instructions:
+
+# Processing Instructions:
 
 ### Script Execution Guide
 
@@ -97,7 +98,9 @@ Update the `=== CONFIGURATION ===` block:
 * **Line 21:** `NPZ_DIR = '...'` -> Change to the directory containing the `.npz` structure files generated in the previous step.
 * **Line 24:** `OUTPUT_FILE = '...'` -> Change to the exact file path (including the `.txt` extension) where you want the validation IDs to be written.
 
-## File Descriptions:
+---
+
+# File Descriptions:
 - pdb_api_call.py: A script that obtains all PDB files from the PDB directory that are both <9 angstroms in resolution and contain 1 or more CCD codes that are considered sugars. Outputs a text file with all the pdb IDs used.
 
 - pdb_api.py: A script that uses a text file of PDB ids and generates a folder of PDB files consisting of the codes in said text file
