@@ -8,7 +8,7 @@
 
 ---
 
-### `pdb_api_call.py`
+#### `pdb_api_call.py`
 This script uses hardcoded directories to save the retrieved PDB IDs. 
 
 **Command:**
@@ -21,7 +21,7 @@ Before running, open the file and modify the following lines to match your local
 
 ---
 
-### `pdb_api.py`
+#### `pdb_api.py`
 This script uses hardcoded directories for both its input list and its output destination.
 
 **Command:**
@@ -34,7 +34,7 @@ Update the configuration section to point to your specific paths:
 
 ---
 
-### `phase1_cleaner.py`
+#### `phase1_cleaner.py`
 This script processes data using hardcoded absolute paths. 
 
 **Command:**
@@ -47,7 +47,7 @@ Locate the `--- HARDCODED CONFIGURATION ---` section and update these paths:
 
 ---
 
-### `free_glycan_data.py`
+#### `free_glycan_data.py`
 This script is executed using command-line arguments (CLI) to specify the input and output folders dynamically.
 
 **Command:**
@@ -59,7 +59,7 @@ This script is executed using command-line arguments (CLI) to specify the input 
 
 ---
 
-### `lectinz_clean.py`
+#### `lectinz_clean.py`
 This script uses hardcoded paths for its input, output, and a necessary `.pkl` file.
 
 **Command:**
@@ -73,7 +73,7 @@ Update the `--- CONFIGURATION ---` block to match your system:
 
 ---
 
-### `preprocess_glycnas.py`
+#### `preprocess_glycnas.py`
 This script relies heavily on CLI arguments to dictate where data is read from, where it goes, and how much compute to use.
 
 **Command:**
@@ -87,7 +87,7 @@ This script relies heavily on CLI arguments to dictate where data is read from, 
 
 ---
 
-### `validation_data_creation.py`
+#### `validation_data_creation.py`
 This script uses hardcoded paths to locate the `.npz` files and determine where to drop the text file containing the validation IDs.
 
 **Command:**
